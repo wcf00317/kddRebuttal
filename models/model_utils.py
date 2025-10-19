@@ -416,6 +416,13 @@ def compute_state_for_har(args, model, train_set, candidate_video_indices, label
             if features.shape[0] > 1:
                 features = features.mean(dim=0, keepdim=True)
 
+            if features.ndim == 5:
+                features = features.mean(dim=(2, 3, 4))
+            elif features.ndim == 4:
+                features = features.mean(dim=(2, 3))
+            elif features.ndim == 3:
+                features = features.mean(dim=2)
+
             if features.dim() == 1:
                 features = features.unsqueeze(0)
 
@@ -614,7 +621,13 @@ def select_action_for_har(args, policy_net, all_state, steps_done, test=False):
                 for i in range(0, state_pool.size(0), batch_size):
                     clip_batch = state_pool[i:i + batch_size].cuda()  # [B, D]
                     # repeat subset embedding 为 clip_batch 的 batch size
-                    subset_batch = state_subset.unsqueeze(0).repeat(clip_batch.size(0), 1, 1).cuda()  # [B, M, D]
+                    if state_subset.dim() == 2:
+                        subset_batch = state_subset.unsqueeze(0).repeat(clip_batch.size(0), 1, 1).cuda()  # [B,1,D]
+                    else:
+                        subset_batch = state_subset.repeat(clip_batch.size(0), 1, 1).cuda() 
+                    # subset_batch = state_subset.unsqueeze(0).repeat(clip_batch.size(0), 1, 1).cuda()  # [B, M, D]
+                    # print("--- Ablation Study: Historical information (subset) is zeroed out before policy net. ---")
+                    # subset_batch = torch.zeros_like(subset_batch) # todo: ablation std
                     q_val = policy_net(clip_batch, subset_batch).cpu()  # 输出 [B, 1]
                     q_vals.append(q_val)
                 q_vals = torch.cat(q_vals, dim=0).squeeze()  # 从 [N, 1] 变为 [N]
@@ -770,97 +783,531 @@ def compute_entropy_seg(args, im_t, net):
     return ent
 
 
-def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP, BATCH_SIZE=32, GAMMA=0.999,
-                        dqn_epochs=1):
-    """
-    此版本适配包含 state_pool, state_subset 等多个独立字段的 Transition 结构。
-    """
+import torch
+import torch.nn.functional as F
+
+def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP,
+                        GAMMA, BATCH_SIZE, grad_clip=1.0, use_padding=True):
+    import torch
+    import torch.nn.functional as F
+    import random
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    print("\n=== [DEBUG] Enter optimize_model_conv ===")
+    print(f"len(memory): {len(memory)}, BATCH_SIZE: {BATCH_SIZE}")
+
     if len(memory) < BATCH_SIZE:
+        print("[DEBUG] Memory not enough, skipping update.")
         return
 
-    print('Optimizing policy network...')
-    policy_net.train()
-    loss_item = 0
+    # ---- Sample ----
+    transitions = memory.sample(BATCH_SIZE)
+    batch = Transition(*zip(*transitions))
 
-    for ep in range(dqn_epochs):
-        optimizerP.zero_grad()
-        transitions = memory.sample(BATCH_SIZE)
-        batch = Transition(*zip(*transitions))
+    if random.random() < 0.02:
+        print("[DEBUG] Sample example:]")
+        ex_r = batch.reward[0].item() if torch.is_tensor(batch.reward[0]) else batch.reward[0]
+        print("  reward:", ex_r)
+        print("  action:", batch.action[0])
+        print("  state_pool shape:", tuple(batch.state_pool[0].shape) if torch.is_tensor(batch.state_pool[0]) else None)
+        print("  next_state_pool is None?", batch.next_state_pool[0] is None)
 
-        # 1. 创建非终止状态的掩码
-        non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
-                                                batch.next_state_pool)),  # 使用 next_state_pool 检查
-                                      dtype=torch.bool, device='cuda')
+    # ---- Masks ----
+    non_final_mask = torch.tensor(tuple(s is not None for s in batch.next_state_pool),
+                                  device=device, dtype=torch.bool)
+    print("[DEBUG] non_final_mask shape:", tuple(non_final_mask.shape),
+          "sum:", int(non_final_mask.sum().item()))
 
-        # 2. 准备下一状态的两个部分
-        non_final_next_states_pool = torch.cat([s for s in batch.next_state_pool if s is not None])
-        non_final_next_states_subset = torch.cat([s for s in batch.next_state_subset if s is not None])
+    # ---- Batches ----
+    state_batch_pool   = torch.cat(batch.state_pool).to(device)         # [B,D] or [B,1,D]
+    state_batch_subset = torch.cat(batch.state_subset).to(device)       # [B,M,D] or [B,1,1,D] or [B,D]
 
-        # 3. 准备当前状态的两个部分
-        state_batch_pool = torch.cat(batch.state_pool)
-        state_batch_subset = torch.cat(batch.state_subset)
+    # x -> [B,D]
+    if state_batch_pool.dim() == 3 and state_batch_pool.size(1) == 1:
+        state_batch_pool = state_batch_pool.squeeze(1)
+    assert state_batch_pool.dim() == 2, f"state_batch_pool should be [B,D], got {state_batch_pool.shape}"
 
-        # 4. 准备 action 和 reward
-        action_batch = torch.stack(batch.action).cuda()  # ✅ This is the correct fix
-        reward_batch = torch.stack(batch.reward).cuda()
+    # subset -> [B,M,D]
+    while state_batch_subset.dim() > 3:
+        state_batch_subset = state_batch_subset.squeeze(1)
+    if state_batch_subset.dim() == 2:
+        state_batch_subset = state_batch_subset.unsqueeze(1)
+    elif state_batch_subset.dim() == 3 and state_batch_subset.size(1) == 0:
+        state_batch_subset = state_batch_subset.reshape(state_batch_subset.size(0), 1, state_batch_subset.size(-1))
+    assert state_batch_subset.dim() == 3, f"state_batch_subset should be [B,M,D], got {state_batch_subset.shape}"
 
-        # 计算 Q(s_t, a)
-        q_val = policy_net(state_batch_pool.cuda(), state_batch_subset.cuda())
+    action_batch = torch.cat([a.unsqueeze(0) for a in batch.action]).to(device)  # [B]
+    reward_batch = torch.cat([r.unsqueeze(0) for r in batch.reward]).to(device)  # [B]
 
-        # print("q_val.shape:", q_val.shape)
-        # print("action_batch.shape:", action_batch.shape)
-        # print("action_batch unique values:", action_batch.unique())
+    print("[DEBUG] state_batch_pool:", tuple(state_batch_pool.shape))
+    print("[DEBUG] state_batch_subset:", tuple(state_batch_subset.shape))
+    print("[DEBUG] action_batch:", tuple(action_batch.shape),
+          "min:", float(action_batch.min().item()), "max:", float(action_batch.max().item()))
+    r_min, r_max, r_std = float(reward_batch.min().item()), float(reward_batch.max().item()), float(reward_batch.std().item())
+    print("[DEBUG] reward_batch:", tuple(reward_batch.shape), "min:", r_min, "max:", r_max, "std:", r_std)
+    if r_std < 1e-6:
+        print("[WARN] Reward variance too small -> 模型很难学到差异。请检查 reward 设计。")
 
-        # state_action_values = q_val.gather(1, action_batch.unsqueeze(1))
-        state_action_values = q_val.squeeze(-1)  # 或 q_val.flatten()，得到 [B]
+    # ---- Q(s,a) ----
+    q_sa = policy_net(state_batch_pool, state_batch_subset)
+    if q_sa.dim() == 2 and q_sa.size(1) == 1:
+        q_sa = q_sa.squeeze(1)
+    q_sa = torch.nan_to_num(q_sa, nan=0.0, posinf=1e6, neginf=-1e6)
+    print("[DEBUG] q_sa shape:", tuple(q_sa.shape),
+          "min:", float(q_sa.min().item()), "max:", float(q_sa.max().item()))
 
-        # 计算 V(s_{t+1})
-        next_state_values = torch.zeros(BATCH_SIZE, device='cuda')
+    # ---- target: max_{a'} Q_target(s',a') ----
+    next_state_values = torch.zeros(BATCH_SIZE, device=device)
 
-        if non_final_mask.sum().item() > 0:
-            # 使用 Double DQN 逻辑
-            next_q_values_policy = policy_net(non_final_next_states_pool.cuda(),
-                                              non_final_next_states_subset.cuda()).detach()
-            best_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
-            next_q_values_target = target_net(non_final_next_states_pool.cuda(),
-                                              non_final_next_states_subset.cuda()).detach()
-            next_state_values[non_final_mask] = next_q_values_target.gather(1, best_actions).squeeze()
+    if non_final_mask.any():
+        nf_next_subset_list = [s for s in batch.next_state_subset if s is not None]
+        nf_next_pool_list   = [p for p in batch.next_state_pool   if p is not None]
 
-        # 计算期望的 Q 值
-        expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+        # subset_nf -> [B_nf,M,D]
+        nf_next_subset = torch.cat(nf_next_subset_list).to(device)
+        while nf_next_subset.dim() > 3:
+            nf_next_subset = nf_next_subset.squeeze(1)
+        if nf_next_subset.dim() == 2:
+            nf_next_subset = nf_next_subset.unsqueeze(1)
+        assert nf_next_subset.dim() == 3, f"nf_next_subset must be [B_nf,M,D], got {nf_next_subset.shape}"
 
-        # 计算 Huber loss
-        loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+        # 尝试批量路径：要求所有样本的 K 相同
+        try:
+            # 预检查：打印每个样本的 K 以便诊断
+            ks = []
+            for idx, p in enumerate(nf_next_pool_list):
+                shape = tuple(p.shape)
+                # 兼容 [1,K,D] / [K,D] / [1,1,K,D]
+                if len(shape) == 4 and shape[1] == 1:
+                    k_i = shape[2]
+                elif len(shape) == 3:
+                    k_i = shape[1]
+                elif len(shape) == 2:
+                    k_i = 1
+                else:
+                    raise RuntimeError(f"Unexpected next_state_pool item shape: {shape}")
+                ks.append(k_i)
+            if len(set(ks)) != 1 and not use_padding:
+                raise RuntimeError(f"Variable K in batch (ks={ks}) and use_padding=False")
 
-        loss_item += loss.item()
-        progress_bar(ep, dqn_epochs, '[DQN loss %.5f]' % (loss_item / (ep + 1)))
+            # 统一到 [B_nf,K,D]
+            normed = []
+            max_k = max(ks)
+            for p in nf_next_pool_list:
+                x = p.to(device)
+                if x.dim() == 4 and x.size(1) == 1:
+                    x = x.squeeze(1)               # [1,K,D] -> [K,D]
+                if x.dim() == 2:
+                    x = x.unsqueeze(0)             # [D] or [K,D]? if [D], becomes [1,D] then next line handles
+                if x.dim() == 2 and x.size(0) != 1:  # [K,D] already; make it [1,K,D]
+                    x = x.unsqueeze(0)
+                if x.dim() == 2 and x.size(0) == 1:  # [1,D] -> [1,1,D]
+                    x = x.unsqueeze(1)
+                if x.dim() == 3 and x.size(1) == 0:
+                    x = x.reshape(1, 1, x.size(-1))
+                # padding（可选）
+                if use_padding and x.size(1) < max_k:
+                    pad_k = max_k - x.size(1)
+                    x = F.pad(x, (0, 0, 0, pad_k))  # pad K dimension with zeros
+                normed.append(x)  # [1,K,D]
+            nf_next_pool = torch.cat(normed, dim=0)  # [B_nf,K,D]
+
+            B_nf, K, D = nf_next_pool.shape
+            flat_next_x = nf_next_pool.reshape(B_nf * K, D)
+            rep_next_subset = nf_next_subset.unsqueeze(1).expand(B_nf, K, *nf_next_subset.shape[1:]) \
+                                               .reshape(B_nf * K, *nf_next_subset.shape[1:])
+            with torch.no_grad():
+                q_next_all = target_net(flat_next_x, rep_next_subset).reshape(B_nf, K)
+                q_next_all = torch.nan_to_num(q_next_all, nan=0.0, posinf=1e6, neginf=-1e6)
+                # 对 padding 的 0 向量（若启用 padding）做屏蔽：置为 -inf
+                if use_padding and len(set(ks)) != 1:
+                    valid_mask = torch.arange(K, device=device).unsqueeze(0) < torch.tensor(ks, device=device).unsqueeze(1)
+                    q_next_all = q_next_all.masked_fill(~valid_mask, float('-inf'))
+                q_next_max = q_next_all.max(dim=1).values
+
+            next_state_values[non_final_mask] = q_next_max
+            print("[DEBUG] q_next_all:", tuple(q_next_all.shape),
+                  "q_next_max min/max:", float(q_next_max.min().item()), float(q_next_max.max().item()))
+
+        except RuntimeError as e:
+            # 逐样本安全路径（可变 K）
+            print("[WARN] Batch has variable K or shape mismatch; fallback per-sample. err:", e)
+            with torch.no_grad():
+                # 注意：这里的顺序与 nf_next_pool_list 一一对应
+                q_next_max_list = []
+                for j, (pool_j, subset_j) in enumerate(zip(nf_next_pool_list, nf_next_subset_list)):
+                    pj = pool_j.to(device)
+                    sj = subset_j.to(device)
+                    # subset -> [1,M,D]
+                    while sj.dim() > 3:
+                        sj = sj.squeeze(1)
+                    if sj.dim() == 2:
+                        sj = sj.unsqueeze(0)
+                    # pool -> [Kj,D]
+                    if pj.dim() == 4 and pj.size(1) == 1:
+                        pj = pj.squeeze(1)     # [1,K,D] -> [K,D]
+                    if pj.dim() == 3 and pj.size(0) == 1:
+                        pj = pj.squeeze(0)     # [1,K,D] -> [K,D]
+                    if pj.dim() == 2 and pj.size(0) == 1 and pj.size(1) == sj.size(-1):
+                        # [1,D] -> 单动作，兼容
+                        pass
+                    Kj = pj.size(0) if pj.dim() == 2 else 1
+                    if pj.dim() == 1:
+                        pj = pj.unsqueeze(0)   # [D] -> [1,D]
+                        Kj = 1
+                    rep_sj = sj.expand(Kj, *sj.shape[1:])  # [Kj,M,D]
+                    q_all_j = target_net(pj, rep_sj).squeeze(-1)  # [Kj]
+                    q_all_j = torch.nan_to_num(q_all_j, nan=0.0, posinf=1e6, neginf=-1e6)
+                    q_next_max_list.append(q_all_j.max())
+                q_next_max = torch.stack(q_next_max_list, dim=0)  # [B_nf]
+                next_state_values[non_final_mask] = q_next_max
+
+    # ---- Bellman target & loss ----
+    target = reward_batch + GAMMA * next_state_values
+    target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    loss = F.smooth_l1_loss(q_sa, target)
+    print("[DEBUG] loss:", float(loss.item()))
+    if torch.isnan(loss) or torch.isinf(loss):
+        print("[ERROR] Invalid loss detected!")
+        print("q_sa:", q_sa)
+        print("target:", target)
+        return
+
+    # ---- Backprop ----
+    optimizerP.zero_grad(set_to_none=True)
+    loss.backward()
+
+    # 梯度裁剪 + 打印
+    torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=grad_clip)
+    with torch.no_grad():
+        total_norm = 0.0
+        print("\n[GRAD DEBUG] ====== Policy Net Gradients ======")
+        for name, p in policy_net.named_parameters():
+            if p.grad is None:
+                print(f"[WARN] No grad in {name}")
+                continue
+            grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1e6, neginf=-1e6)
+            gnorm = grad.norm().item()
+            total_norm += gnorm ** 2
+            if "cross_attention" in name:
+                tag = "[ATTN]"
+            elif "ffn" in name:
+                tag = "[FFN]"
+            elif "q_predictor" in name:
+                tag = "[HEAD]"
+            else:
+                tag = "[OTHER]"
+            print(f"{tag:8s} {name:40s} | mean={grad.mean():.2e}, std={grad.std():.2e}, norm={gnorm:.2e}")
+        total_norm = total_norm ** 0.5
+        print(f"[GRAD DEBUG] Total grad norm: {total_norm:.4f}")
+        print("[GRAD DEBUG] ====================================\n")
+
+    optimizerP.step()
+
+    optimize_model_conv.last_loss = float(loss.item())
+    optimize_model_conv.last_q_mean = float(q_sa.mean().item())
+    optimize_model_conv.last_reward_mean = float(reward_batch.mean().item())
+    print("=== [DEBUG] Optimization done ===")
+
+
+# def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP,
+#                         GAMMA, BATCH_SIZE):
+#     print("\n=== [DEBUG] Enter optimize_model_conv ===")
+#     print(f"len(memory): {len(memory)}, BATCH_SIZE: {BATCH_SIZE}")
+
+#     if len(memory) < BATCH_SIZE:
+#         print("[DEBUG] Memory not enough, skipping update.")
+#         return
+
+#     # ---- Sample ----
+#     transitions = memory.sample(BATCH_SIZE)
+#     batch = Transition(*zip(*transitions))
+
+#     if random.random() < 0.02:  # 约每50次打印一次
+#         print("[DEBUG] Sample example:")
+#         print("  reward:", batch.reward[0].item() if torch.is_tensor(batch.reward[0]) else batch.reward[0])
+#         print("  action:", batch.action[0])
+#         print("  state_pool shape:", batch.state_pool[0].shape)
+#         print("  next_state_pool is None?", batch.next_state_pool[0] is None)
+
+#     # ---- Masks ----
+#     non_final_mask = torch.tensor(
+#         tuple(map(lambda s: s is not None, batch.next_state_pool)),
+#         device='cuda', dtype=torch.bool
+#     )
+#     print("[DEBUG] non_final_mask shape:", non_final_mask.shape,
+#           "sum:", non_final_mask.sum().item())
+
+#     try:
+#         non_final_next_states = torch.cat([s for s in batch.next_state_pool if s is not None])
+#         non_final_next_state_subset = torch.cat([s for s in batch.next_state_subset if s is not None])
+#         print("[DEBUG] non_final_next_states shape:", non_final_next_states.shape)
+#     except Exception as e:
+#         print("[ERROR] non_final_next_states concat failed:", e)
+#         return
+
+#     # ---- Batches ----
+#     state_batch_pool = torch.cat(batch.state_pool)
+#     state_batch_subset = torch.cat(batch.state_subset)
+#     action_batch = torch.cat([a.unsqueeze(0) for a in batch.action])
+#     reward_batch = torch.cat([r.unsqueeze(0) for r in batch.reward])
+
+#     for i, a in enumerate(batch.action):
+#         if a.dim() == 0:
+#             print(f"[WARN] batch.action[{i}] is scalar:", a)
+
+
+#     print("[DEBUG] state_batch_pool:", state_batch_pool.shape)
+#     print("[DEBUG] state_batch_subset:", state_batch_subset.shape)
+#     print("[DEBUG] action_batch:", action_batch.shape,
+#           "min:", action_batch.min().item(), "max:", action_batch.max().item())
+#     print("[DEBUG] reward_batch:", reward_batch.shape,
+#           "min:", reward_batch.min().item(), "max:", reward_batch.max().item())
+
+#     # ---- Forward ----
+#     q_val = policy_net(state_batch_pool.cuda(), state_batch_subset.cuda())
+#     print("[DEBUG] q_val shape:", q_val.shape)
+
+#     # ---- Gather safety check ----
+#     # if (action_batch >= q_val.size(1)).any():
+#     #     print("[ERROR] action index out of bounds!",
+#     #           "action_batch.max():", action_batch.max().item(),
+#     #           "q_val.size(1):", q_val.size(1))
+#     #     action_batch = action_batch.clamp(0, q_val.size(1) - 1)
+
+#     state_action_values = q_val.squeeze(-1)  # 直接取预测的Q值
+#     print("[DEBUG] state_action_values:", state_action_values.shape)
+
+#     # ---- Next Q computation ----
+#     next_state_values = torch.zeros(BATCH_SIZE, device='cuda')
+
+#     if non_final_mask.sum().item() > 0:
+#         target_out = target_net(non_final_next_states.cuda(), non_final_next_state_subset.cuda())
+#         print("[DEBUG] target_out shape:", target_out.shape)
+#         next_state_values[non_final_mask] = target_out.squeeze(-1).detach()
+
+#     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+#     print("[DEBUG] expected_state_action_values:", expected_state_action_values.shape)
+
+#     # ---- Loss ----
+#     state_action_values = state_action_values.view(-1, 1)  # [B, 1]
+#     expected_state_action_values = expected_state_action_values.view(-1, 1)  # [B, 1]
+#     loss = F.smooth_l1_loss(state_action_values,
+#                             expected_state_action_values.unsqueeze(1))
+#     print("[DEBUG] loss:", loss.item())
+
+#     # ---- Sanity checks ----
+#     if torch.isnan(loss) or torch.isinf(loss):
+#         print("[ERROR] Invalid loss detected!")
+#         print("state_action_values:", state_action_values)
+#         print("expected_state_action_values:", expected_state_action_values)
+#         return
+
+
+#     # ---- Backprop ----
+#     optimizerP.zero_grad()
+#     loss.backward()
+#     for name, param in policy_net.named_parameters():
+#         if param.grad is None:
+#             print(f"[WARN] No grad in {name}")
+#         else:
+#             print(f"[DEBUG] grad[{name}]: mean={param.grad.mean():.6f}, std={param.grad.std():.6f}")
+#     optimizerP.step()
+
+#     optimize_model_conv.last_loss = loss.item()
+#     optimize_model_conv.last_q_mean = q_val.mean().item()
+#     optimize_model_conv.last_reward_mean = reward_batch.mean().item()
+
+#     print("=== [DEBUG] Optimization done ===")
+
+
+# def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP, BATCH_SIZE=32, GAMMA=0.999,
+#                         dqn_epochs=1):
+#     """
+#     此版本适配包含 state_pool, state_subset 等多个独立字段的 Transition 结构。
+#     """
+#     if len(memory) < BATCH_SIZE:
+#         return
+
+#     print('Optimizing policy network...')
+
+#     policy_net.train()
+#     loss_item = 0
+
+#     for ep in range(dqn_epochs):
+#         optimizerP.zero_grad()
+#         transitions = memory.sample(BATCH_SIZE)
+#         batch = Transition(*zip(*transitions))
+
+#         # 1. 创建非终止状态的掩码
+#         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
+#                                                 batch.next_state_pool)),  # 使用 next_state_pool 检查
+#                                       dtype=torch.bool, device='cuda')
+
+#         # 2. 准备下一状态的两个部分
+#         non_final_next_states_pool = torch.cat([s for s in batch.next_state_pool if s is not None])
+#         non_final_next_states_subset = torch.cat([s for s in batch.next_state_subset if s is not None])
+
+#         # 3. 准备当前状态的两个部分
+#         state_batch_pool = torch.cat(batch.state_pool)
+#         state_batch_subset = torch.cat(batch.state_subset)
+
+#         # 4. 准备 action 和 reward
+#         action_batch = torch.stack(batch.action).long().cuda()  # ✅ This is the correct fix
+#         reward_batch = torch.stack(batch.reward).cuda()
+
+#         # 计算 Q(s_t, a)
+#         q_val = policy_net(state_batch_pool.cuda(), state_batch_subset.cuda())
+
+#         # print("q_val.shape:", q_val.shape)
+#         # print("action_batch.shape:", action_batch.shape)
+#         # print("action_batch unique values:", action_batch.unique())
+
+#         state_action_values = q_val.gather(1, action_batch.unsqueeze(1)).squeeze(1)
+#         # state_action_values = q_val.squeeze(-1)  # 或 q_val.flatten()，得到 [B]
+
+#         # 计算 V(s_{t+1})
+#         next_state_values = torch.zeros(BATCH_SIZE, device='cuda')
+
+#         print("=== optimize_model_conv debug ===")
+#         print("batch size:", BATCH_SIZE)
+#         print("non_final_mask:", non_final_mask)
+#         print("non_final_mask.sum():", non_final_mask.sum())
+#         print("actions shape:", action_batch.shape)
+#         print("actions max:", action_batch.max().item(), "min:", action_batch.min().item())
+#         print("q_val shape:", q_val.shape)
+
+#         if non_final_mask.sum().item() > 0:
+#             # 使用 Double DQN 逻辑
+#             next_q_values_policy = policy_net(non_final_next_states_pool.cuda(),
+#                                               non_final_next_states_subset.cuda()).detach()
+#             best_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
+#             next_q_values_target = target_net(non_final_next_states_pool.cuda(),
+#                                               non_final_next_states_subset.cuda()).detach()
+#             next_state_values[non_final_mask] = next_q_values_target.gather(1, best_actions).squeeze()
+
+#         # 计算期望的 Q 值
+#         expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+
+#         # 计算 Huber loss
+#         loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+
+#         loss_item += loss.item()
+#         progress_bar(ep, dqn_epochs, '[DQN loss %.5f]' % (loss_item / (ep + 1)))
         
-        loss.backward()
+#         loss.backward()
+#         total_grad = 0.0
+#         for n, p in policy_net.named_parameters():
+#             if p.grad is not None:
+#                 total_grad += p.grad.norm().item()
+#         print(f"[GradNorm] {total_grad:.6f}")
 
-        # REASON: 强化学习的训练过程容易不稳定，可能会产生非常大的梯度，
-        #         导致网络权重更新过猛（“梯度爆炸”），从而破坏学习过程。
-        #         梯度裁剪将所有参数的梯度范数强制限制在一个最大值（这里是1.0）以内，
-        #         确保了每次更新的步长都是合理的，从而极大地稳定了训练。
-        torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
-        optimizerP.step()
+#         # REASON: 强化学习的训练过程容易不稳定，可能会产生非常大的梯度，
+#         #         导致网络权重更新过猛（“梯度爆炸”），从而破坏学习过程。
+#         #         梯度裁剪将所有参数的梯度范数强制限制在一个最大值（这里是1.0）以内，
+#         #         确保了每次更新的步长都是合理的，从而极大地稳定了训练。
+#         torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
+#         optimizerP.step()
 
-        del (q_val)
-        del (expected_state_action_values)
-        del (loss)
-        del (next_state_values)
-        del (reward_batch)
-        # if non_final_mask.sum().item() > 0:
-        #     del (act)
-        #     del (v_val)
-        #     del (v_val_act)
-        del (state_action_values)
-        # del (state_batch)
-        del (action_batch)
-        del (non_final_mask)
-        # del (non_final_next_states)
-        del (batch)
-        del (transitions)
-    lab_set = open(os.path.join(args.ckpt_path, args.exp_name, 'q_loss.txt'), 'a')
-    lab_set.write("%f" % (loss_item))
-    lab_set.write("\n")
-    lab_set.close()
+#         del (q_val)
+#         del (expected_state_action_values)
+#         del (loss)
+#         del (next_state_values)
+#         del (reward_batch)
+#         # if non_final_mask.sum().item() > 0:
+#         #     del (act)
+#         #     del (v_val)
+#         #     del (v_val_act)
+#         del (state_action_values)
+#         # del (state_batch)
+#         del (action_batch)
+#         del (non_final_mask)
+#         # del (non_final_next_states)
+#         del (batch)
+#         del (transitions)
+#     lab_set = open(os.path.join(args.ckpt_path, args.exp_name, 'q_loss.txt'), 'a')
+#     lab_set.write("%f" % (loss_item))
+#     lab_set.write("\n")
+#     lab_set.close()
+
+def debug_optimize_model_conv(memory, Transition, BATCH_SIZE=4):
+    import torch
+    import random
+
+    print("\n=== [DEBUG MODE] Checking shapes inside ReplayMemory ===")
+
+    if len(memory) < BATCH_SIZE:
+        print(f"[WARN] Memory not enough: len={len(memory)}, need {BATCH_SIZE}")
+        return
+
+    transitions = memory.sample(BATCH_SIZE)
+    batch = Transition(*zip(*transitions))
+
+    print(f"[INFO] Sampled {BATCH_SIZE} transitions.")
+    print("-----------------------------------------------------------")
+
+    # 检查每个字段的类型与形状
+    for i in range(BATCH_SIZE):
+        print(f"\n[Transition #{i}] -----------------------------")
+
+        # state_pool
+        s_pool = batch.state_pool[i]
+        if s_pool is None:
+            print("state_pool: None")
+        elif torch.is_tensor(s_pool):
+            print(f"state_pool: tensor, shape={tuple(s_pool.shape)}, dtype={s_pool.dtype}")
+        else:
+            print(f"state_pool: {type(s_pool)}")
+
+        # state_subset
+        s_sub = batch.state_subset[i]
+        if s_sub is None:
+            print("state_subset: None")
+        elif torch.is_tensor(s_sub):
+            print(f"state_subset: tensor, shape={tuple(s_sub.shape)}, dtype={s_sub.dtype}")
+        else:
+            print(f"state_subset: {type(s_sub)}")
+
+        # action
+        act = batch.action[i]
+        if torch.is_tensor(act):
+            print(f"action: tensor, shape={tuple(act.shape)}, value range=({act.min().item():.3g},{act.max().item():.3g})")
+        else:
+            print(f"action: {act} ({type(act)})")
+
+        # next_state_pool
+        nxtp = batch.next_state_pool[i]
+        if nxtp is None:
+            print("next_state_pool: None (terminal)")
+        elif torch.is_tensor(nxtp):
+            print(f"next_state_pool: tensor, shape={tuple(nxtp.shape)}, dtype={nxtp.dtype}")
+        else:
+            print(f"next_state_pool: {type(nxtp)}")
+
+        # next_state_subset
+        nxts = batch.next_state_subset[i]
+        if nxts is None:
+            print("next_state_subset: None")
+        elif torch.is_tensor(nxts):
+            print(f"next_state_subset: tensor, shape={tuple(nxts.shape)}, dtype={nxts.dtype}")
+        else:
+            print(f"next_state_subset: {type(nxts)}")
+
+        # reward
+        r = batch.reward[i]
+        if torch.is_tensor(r):
+            print(f"reward: tensor, shape={tuple(r.shape)}, val={r.item():.6f}")
+        else:
+            print(f"reward: {r} ({type(r)})")
+
+    # 汇总统计
+    shapes_pool = [tuple(s.shape) for s in batch.next_state_pool if torch.is_tensor(s)]
+    if len(shapes_pool) > 0:
+        unique_shapes = list(set(shapes_pool))
+        print("\n[SUMMARY] Unique shapes of next_state_pool in this batch:", unique_shapes)
+    else:
+        print("\n[SUMMARY] No valid tensor in next_state_pool.")
+
+    print("=== [DEBUG MODE] Done ===\n")

@@ -68,6 +68,7 @@ def get_arguments():
     parser.add_argument('--rl_episodes', type=int, default=10)
     parser.add_argument('--rl_buffer', type=int, default=100)
     parser.add_argument('--dqn_bs', type=int, default=5)
+    parser.add_argument('--dqn_opt_per_iter', type=int, default=10)
     parser.add_argument('--dqn_gamma', type=float, default=0.99)
     parser.add_argument('--egl_strategy', type=str, default='adaptive_k',
                         choices=['adaptive_k', 'approx', 'standard'],

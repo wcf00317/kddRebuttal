@@ -52,7 +52,7 @@ class Logger(object):
             self.file.write("{0:.6f}".format(num) + '\t')
             self.numbers[self.names[idx]].append(float(num))
         self.file.write('\n')
-        self.file.flush()
+        # self.file.flush()
 
     def close(self):
         if self.file is not None:

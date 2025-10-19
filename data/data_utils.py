@@ -289,18 +289,25 @@ def get_data(
 
     g = torch.Generator()
     g.manual_seed(seed)
-
+    num_cpu = os.cpu_count()
     train_loader = DataLoader(train_subset,
                               batch_size=tr_bs,
                               shuffle=True,
-                              num_workers=n_workers,
+                                num_workers=min(max(8, num_cpu // 2), 32),  # 建议 16–32 之间
                               drop_last=False,
                               worker_init_fn=seed_worker, # <-- 应用 worker 初始化函数
+                              pin_memory=True,              # ✅ GPU 数据拷贝走 page-locked 内存
+                              prefetch_factor=4,            # ✅ 每 worker 预取更多 batch，减少等待
+                              persistent_workers=True,      # ✅ 不在每 epoch 重启 worker
                               generator=g)
 
     val_loader = DataLoader(val_set,
                             batch_size=vl_bs,
                             shuffle=False,
-                            num_workers=n_workers)
+                            num_workers=min(max(8, num_cpu // 2), 32),
+                            pin_memory=True,
+                            prefetch_factor=4,
+                            persistent_workers=True
+                        )
 
     return train_loader, train_full_dataset, val_loader, train_full_dataset

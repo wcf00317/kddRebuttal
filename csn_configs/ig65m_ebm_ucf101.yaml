@@ -6,7 +6,7 @@
 dataset: ucf101
 data_path: ../ucf101
 ckpt_path: ./checkpoints
-exp_name: ucf101_ebm_from_ig65m # 实验名更新
+exp_name: ucf101_ebm_from_ig65m_final # 实验名更新
 model_type: csn
 seed: 42
 

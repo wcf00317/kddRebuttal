@@ -34,11 +34,9 @@ import pickle
 cudnn.benchmark = False
 cudnn.deterministic = True
 
-
 def train_har_classifier(args, curr_epoch, train_loader, net, criterion, optimizer,
                          val_loader, best_record, logger, scheduler, schedulerP,
                          final_train=False,epochs_to_run=None):
-    # (此函数保持不变)
     best_val_acc = best_record.get('top1_acc', 0.0)
     patience_counter = 0
     if epochs_to_run is None:

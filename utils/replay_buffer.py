@@ -1,14 +1,12 @@
-# Adapted from https://pytorch.org/tutorials/intermediate/reinforcement_q_learning.html
+# 文件路径: utils/replay_buffer.py (已修正并确认)
+
 from collections import namedtuple
 import random
 
-EPS_START = 0.9
-EPS_END = 0.05
-EPS_DECAY = 10
-
-# Definition needed to store memory replay in pickle
+# 【修正1】: 统一并修正 Transition 的定义
+# 字段名 'state_pool', 'next_state_pool' 等与主脚本和优化函数中的期望保持一致
 Transition = namedtuple('Transition',
-                        ('state', 'state_subset', 'action', 'next_state', 'next_state_subset', 'reward'))
+                        ('state_pool', 'state_subset', 'action', 'next_state_pool', 'next_state_subset', 'reward'))
 
 
 class ReplayMemory(object):
@@ -21,30 +19,20 @@ class ReplayMemory(object):
         self.memory = []
         self.position = 0
 
-    def push(self, current_state, action, next_state, reward):
-        """Saves a transition."""
-        if next_state is None:
-            next_state = {'pool': [None] * current_state['pool'].size()[0], 'subset': None}
-        for cs, a, ns, r in zip(current_state['pool'], action, next_state['pool'], reward):
-            if len(self.memory) < self.capacity:
-                self.memory.append(None)
+    # 【修正2】: 修正 push 方法的逻辑
+    def push(self, state_pool, state_subset, action, next_state_pool, next_state_subset, reward):
+        """Saves a single, complete transition."""
+        # 此方法现在正确地接收6个独立的参数
 
-            self.memory[self.position] = None
-            self.memory[self.position] = Transition(cs.unsqueeze(0), current_state['subset'].unsqueeze(0), a,
-                                                    ns.unsqueeze(0) if ns is not None else ns,
-                                                    next_state['subset'].unsqueeze(0) if next_state[
-                                                                                             'subset'] is not None else
-                                                    next_state['subset'], r)
-            self.position = (self.position + 1) % self.capacity
+        # 确保内存中有空间，如果满了就从头开始覆盖旧的
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
 
-            del (cs)
-            del (a)
-            del (ns)
-            del (r)
-        del (current_state)
-        del (action)
-        del (next_state)
-        del (reward)
+        # 直接使用传入的6个参数创建一个 Transition 对象并存储
+        # 之前那个有问题的 for 循环被完全移除了
+        self.memory[self.position] = Transition(state_pool, state_subset, action, next_state_pool, next_state_subset,
+                                                reward)
+        self.position = (self.position + 1) % self.capacity
 
     def sample(self, batch_size):
         return random.sample(self.memory, batch_size)

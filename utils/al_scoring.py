@@ -91,6 +91,19 @@ def compute_entropy_score(precomputed_data):
 def compute_diversity_score(precomputed_data):
     """基于 batch 内 embeddings 的平均相似度计算多样性（相似度越高，多样性越低）。"""
     embeddings = precomputed_data['embeddings']
+    # print("DEBUG:", embeddings.shape)
+
+    if embeddings.ndim > 2:
+        # 如果是 [N, C, T, H, W] 这类5D，取时空平均
+        if embeddings.ndim == 5:
+            embeddings = embeddings.mean(dim=(2, 3, 4))
+        elif embeddings.ndim == 4:
+            embeddings = embeddings.mean(dim=(2, 3))
+        elif embeddings.ndim == 3:
+            embeddings = embeddings.mean(dim=2)
+        else:
+            raise ValueError(f"Unexpected embeddings shape: {embeddings.shape}")
+
     if embeddings.shape[0] < 2:
         return torch.zeros(embeddings.shape[0])
 
@@ -101,13 +114,51 @@ def compute_diversity_score(precomputed_data):
     diversity_scores = 1.0 - mean_sim   # 越低表示越相似，越高表示更 diverse
     return diversity_scores
 
+# def compute_diversity_score(precomputed_data):
+#     embeddings = precomputed_data['embeddings']
+#     print("DEBUG:", embeddings.shape)
+#     if embeddings.shape[0] < 2:
+#         return torch.zeros(embeddings.shape[0])
+
+#     # --- 🔧 强制二维化 ---
+#     if embeddings.ndim > 2:
+#         embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+
+#     normed_embeds = F.normalize(embeddings, dim=1)
+#     sim_matrix = torch.matmul(normed_embeds, normed_embeds.T)
+#     sim_matrix.fill_diagonal_(0.0)
+#     mean_sim = sim_matrix.mean(dim=1)
+#     diversity_scores = 1.0 - mean_sim
+#     return diversity_scores
+
+
+
+# def compute_representativeness_score(precomputed_data):
+#     """(3) 基于预计算的嵌入计算代表性分数（到质心的余弦相似度）。"""
+#     embeddings = precomputed_data['embeddings']
+#     if embeddings.shape[0] == 0: return torch.empty(0)
+#     centroid = torch.mean(embeddings, dim=0, keepdim=True)
+#     return F.cosine_similarity(embeddings, centroid.squeeze(0), dim=1)
 
 def compute_representativeness_score(precomputed_data):
     """(3) 基于预计算的嵌入计算代表性分数（到质心的余弦相似度）。"""
     embeddings = precomputed_data['embeddings']
-    if embeddings.shape[0] == 0: return torch.empty(0)
+    if embeddings.shape[0] == 0:
+        return torch.empty(0)
+
+    # --- 🔧 统一维度: 将 [N, C, T, H, W] -> [N, C] ---
+    if embeddings.ndim == 5:
+        embeddings = embeddings.mean(dim=(2, 3, 4))
+    elif embeddings.ndim == 4:
+        embeddings = embeddings.mean(dim=(2, 3))
+    elif embeddings.ndim == 3:
+        embeddings = embeddings.mean(dim=2)
+    elif embeddings.ndim != 2:
+        raise ValueError(f"Unexpected embeddings shape: {embeddings.shape}")
+
     centroid = torch.mean(embeddings, dim=0, keepdim=True)
     return F.cosine_similarity(embeddings, centroid.squeeze(0), dim=1)
+
 
 def compute_prediction_margin_score(precomputed_data):
     """(4) 基于预计算的概率计算预测边际分数。"""
@@ -116,39 +167,120 @@ def compute_prediction_margin_score(precomputed_data):
     sorted_probs, _ = torch.sort(probs, dim=1, descending=True)
     return 1.0 - (sorted_probs[:, 0] - sorted_probs[:, 1])
 
+# def compute_labeled_distance_score(precomputed_data):
+#     """(5) 基于预计算的嵌入计算与已标注集的最小距离分数。"""
+#     embeddings = precomputed_data['embeddings']
+#     labeled_embeddings = precomputed_data['labeled_embeddings']
+#     if labeled_embeddings is None or labeled_embeddings.shape[0] == 0:
+#         return torch.zeros(embeddings.shape[0])
+#     dist_matrix = torch.cdist(embeddings, labeled_embeddings)
+#     scores, _ = torch.min(dist_matrix, dim=1)
+#     return scores
 def compute_labeled_distance_score(precomputed_data):
     """(5) 基于预计算的嵌入计算与已标注集的最小距离分数。"""
     embeddings = precomputed_data['embeddings']
     labeled_embeddings = precomputed_data['labeled_embeddings']
+
+    # --- 🧩 统一维度: 如果是 [N, C, T, H, W] 或 [N, C, H, W] 等，取时空平均 ---
+    def flatten_embeddings(x):
+        if x is None:
+            return None
+        if x.ndim == 5:
+            return x.mean(dim=(2, 3, 4))
+        elif x.ndim == 4:
+            return x.mean(dim=(2, 3))
+        elif x.ndim == 3:
+            return x.mean(dim=2)
+        elif x.ndim == 2:
+            return x
+        else:
+            raise ValueError(f"Unexpected embedding shape: {x.shape}")
+
+    embeddings = flatten_embeddings(embeddings)
+    labeled_embeddings = flatten_embeddings(labeled_embeddings)
+
     if labeled_embeddings is None or labeled_embeddings.shape[0] == 0:
         return torch.zeros(embeddings.shape[0])
-    dist_matrix = torch.cdist(embeddings, labeled_embeddings)
+
+    # ✅ 确认特征维度一致
+    assert embeddings.shape[1] == labeled_embeddings.shape[1], \
+        f"Embedding dim mismatch: unlabeled {embeddings.shape}, labeled {labeled_embeddings.shape}"
+
+    dist_matrix = torch.cdist(embeddings, labeled_embeddings)  # [N_unlab, N_lab]
     scores, _ = torch.min(dist_matrix, dim=1)
     return scores
 
 def compute_neighborhood_density_score(precomputed_data, k=10):
-    """基于预计算的 embeddings 计算邻域密度分数。
-    分数定义为样本与其 k 近邻的平均距离的倒数。
-    """
     embeddings = precomputed_data['embeddings']
+
+    # --- 🔧 统一维度 ---
+    if embeddings.ndim == 5:
+        embeddings = embeddings.mean(dim=(2, 3, 4))
+    elif embeddings.ndim == 4:
+        embeddings = embeddings.mean(dim=(2, 3))
+    elif embeddings.ndim == 3:
+        embeddings = embeddings.mean(dim=2)
+    elif embeddings.ndim != 2:
+        raise ValueError(f"Unexpected embedding shape: {embeddings.shape}")
+
     n = embeddings.shape[0]
     if n <= k:
         return torch.zeros(n)
 
     dist_matrix = torch.cdist(embeddings, embeddings, p=2)
-    dist_matrix.fill_diagonal_(float('inf'))  # 去掉自距离 0
+    dist_matrix.fill_diagonal_(float('inf'))
 
-    knn_dists = torch.topk(dist_matrix, k, largest=False, dim=1).values  # [N, k]
-    mean_knn_dist = knn_dists.mean(dim=1)  # 每个样本的平均kNN距离
+    knn_dists = torch.topk(dist_matrix, k, largest=False, dim=1).values
+    mean_knn_dist = knn_dists.mean(dim=1)
     return 1.0 / (1.0 + mean_knn_dist)
 
-
 def compute_temporal_consistency_score(precomputed_data):
-    """(7) 基于预计算的快慢速嵌入计算时间一致性分数。"""
+    """(7) 基于预计算的快慢速嵌入计算时间一致性分数（每个视频一个分数）。"""
     fast_embeds = precomputed_data['fast_embeds']
     slow_embeds = precomputed_data['slow_embeds']
-    if fast_embeds.shape[0] == 0: return torch.empty(0)
+
+    if fast_embeds.shape[0] == 0:
+        return torch.empty(0)
+
+    # --- 🔧 统一形状 [N, C, T, H, W] -> [N, C]
+    if fast_embeds.ndim == 5:
+        fast_embeds = fast_embeds.mean(dim=(2, 3, 4))
+        slow_embeds = slow_embeds.mean(dim=(2, 3, 4))
+    elif fast_embeds.ndim == 4:
+        fast_embeds = fast_embeds.mean(dim=(2, 3))
+        slow_embeds = slow_embeds.mean(dim=(2, 3))
+    elif fast_embeds.ndim == 3:
+        fast_embeds = fast_embeds.mean(dim=2)
+        slow_embeds = slow_embeds.mean(dim=2)
+    elif fast_embeds.ndim != 2:
+        raise ValueError(f"Unexpected embedding shape: {fast_embeds.shape}")
+
+    # --- 🔁 计算每个视频的一致性分数
     return 1.0 - F.cosine_similarity(fast_embeds, slow_embeds, dim=1)
+
+# def compute_neighborhood_density_score(precomputed_data, k=10):
+#     """基于预计算的 embeddings 计算邻域密度分数。
+#     分数定义为样本与其 k 近邻的平均距离的倒数。
+#     """
+#     embeddings = precomputed_data['embeddings']
+#     n = embeddings.shape[0]
+#     if n <= k:
+#         return torch.zeros(n)
+
+#     dist_matrix = torch.cdist(embeddings, embeddings, p=2)
+#     dist_matrix.fill_diagonal_(float('inf'))  # 去掉自距离 0
+
+#     knn_dists = torch.topk(dist_matrix, k, largest=False, dim=1).values  # [N, k]
+#     mean_knn_dist = knn_dists.mean(dim=1)  # 每个样本的平均kNN距离
+#     return 1.0 / (1.0 + mean_knn_dist)
+
+
+# def compute_temporal_consistency_score(precomputed_data):
+#     """(7) 基于预计算的快慢速嵌入计算时间一致性分数。"""
+#     fast_embeds = precomputed_data['fast_embeds']
+#     slow_embeds = precomputed_data['slow_embeds']
+#     if fast_embeds.shape[0] == 0: return torch.empty(0)
+#     return 1.0 - F.cosine_similarity(fast_embeds, slow_embeds, dim=1)
 
 
 # --- 以下是需要独立计算的评分函数 ---
