@@ -36,28 +36,74 @@ cudnn.deterministic = True
 
 
 # (VerboseLogger 类与 run_minimalist_tournament.py 中保持一致)
+import sys
+
 class VerboseLogger:
     def __init__(self, log_path):
         self.terminal = sys.stdout
-        self.log_file = open(log_path, "a", encoding='utf-8')
+        try:
+            # 有些文件系统（如HDFS挂载）不支持写操作
+            self.log_file = open(log_path, "a", encoding='utf-8')
+            self.file_enabled = True
+        except Exception as e:
+            self.log_file = None
+            self.file_enabled = False
+            print(f"[Logger Warning] 无法打开日志文件 {log_path}: {e}")
 
     def write(self, message):
-        self.terminal.write(message)
-        self.log_file.write(message)
+        # 永远输出到控制台
+        try:
+            self.terminal.write(message)
+        except Exception:
+            pass
+
+        # 尝试写入日志文件（但如果不支持，就跳过）
+        if self.file_enabled and self.log_file is not None:
+            try:
+                self.log_file.write(message)
+            except OSError as e:
+                if e.errno == 95:  # Operation not supported
+                    print(f"[Logger Warning] 文件系统不支持写入日志 ({e}); 将仅输出到控制台。")
+                else:
+                    print(f"[Logger Warning] 写日志出错: {e}")
+                self.file_enabled = False
+                self.log_file = None
+            except Exception as e:
+                print(f"[Logger Warning] 写日志出错: {e}")
+                self.file_enabled = False
+                self.log_file = None
 
     def flush(self):
-        self.terminal.flush()
-        self.log_file.flush()
+        try:
+            self.terminal.flush()
+        except Exception:
+            pass
+        if self.file_enabled and self.log_file is not None:
+            try:
+                self.log_file.flush()
+            except Exception:
+                pass
 
     def __del__(self):
         try:
-            self.log_file.close()
+            if self.log_file:
+                self.log_file.close()
         except Exception:
             pass
 
 
 def get_available_strategies(args):
     """根据配置文件动态获取所有启用的策略及其对应的评分函数。"""
+    # print("!!! [ABLATION MODE] Running MODEL-DRIVEN strategies ONLY !!!")
+    # model_driven_strategies = [
+    #     ('entropy', scoring.compute_entropy_score),
+    #     ('prediction_margin', scoring.compute_prediction_margin_score),
+    #     ('bald', scoring.compute_bald_score),
+    #     ('egl', scoring.compute_egl_adaptive_topk)
+    # ]
+    # print(f"启用的策略共 {len(model_driven_strategies)} 个: {[name for name, _ in model_driven_strategies]}")
+    # return model_driven_strategies
+
     strategy_map = {
         'use_statistical_features': ('entropy', scoring.compute_entropy_score),
         'use_diversity_feature': ('diversity', scoring.compute_diversity_score),
@@ -127,7 +173,6 @@ def main():
     #     args, net_stage1, unlabeled_indices, train_set, batch_size=args.val_batch_size
     # )
 
-    strategies_to_run = get_available_strategies(args)
     print("正在为所有策略预计算全局分数...")
     strategies_to_run = get_available_strategies(args)
     precomputed_data = scoring.precompute_data_for_scoring(
@@ -198,7 +243,8 @@ def main():
     # ===================================================================================
     print("\n" + "=" * 25 + "  STAGE 2: EBM REWARD MODEL TRAINING  " + "=" * 25)
 
-    training_successful = train_ebm_reward_model(alrm_preference_data, exp_dir)
+    training_successful = train_ebm_reward_model(alrm_preference_data, exp_dir,
+        feature_names=feature_extractor.feature_dim_names)
 
     if not training_successful:
         print("EBM奖励模型训练失败，工作流程终止。")
@@ -239,7 +285,7 @@ def main():
     ebm_scorer = load_ebm_scorer(exp_dir)
 
     Transition = namedtuple('Transition',
-                            ('state_pool', 'state_subset', 'action', 'next_state_pool', 'next_state_subset', 'reward'))
+                            ('state_pool', 'state_subset', 'action', 'next_state_pool', 'next_state_subset', 'reward'))    
     memory = ReplayMemory(args.rl_buffer)
     TARGET_UPDATE = 5
     steps_done = 0
@@ -301,8 +347,32 @@ def main():
                                                      train_set_rl.get_candidates_video_ids(),
                                                      list(train_set_rl.labeled_video_ids))
 
-        memory.push(current_state, action, next_state,
-                    torch.tensor([predicted_reward], dtype=torch.float, device='cuda'))
+        sel_idxs = action.tolist()  # 选中的样本在候选池中的行号
+        pool = current_state['pool']  # [N, D]
+        subset = current_state['subset']  # [M, D]
+
+        # 下一个状态（若还有预算）
+        if next_state is not None:
+            next_pool = next_state['pool']  # [N_next, D]
+            next_subset = next_state['subset']  # [M, D]
+        else:
+            next_pool, next_subset = None, None
+
+        # 批次级 reward（标量）
+        reward_scalar = float(predicted_reward)
+        reward_tensor = torch.as_tensor(reward_scalar, dtype=torch.float, device='cuda')  # 0-D 张量
+
+        for idx in sel_idxs:
+            action_embed = pool[idx]  # [D] —— “被执行的动作的向量”，样本级
+            memory.push(
+                action_embed,  # ← state_pool 实际承载“动作向量 [D]”
+                subset.unsqueeze(0).cuda(non_blocking=True),  # [1, M, D]
+                torch.tensor(idx, device='cuda'),  # 0-D 动作索引（未在优化器中使用，但保留无害）
+                None if next_pool is None else next_pool.unsqueeze(0),  # [1, N_next, D] or None
+                None if next_subset is None else next_subset.unsqueeze(0),  # [1, M, D]     or None
+                reward_tensor.clone()  # 0-D 张量；每条 transition 同一个批次级 reward
+            )
+
         if len(memory) >= args.dqn_bs:
             optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP, GAMMA=args.dqn_gamma,
                                 BATCH_SIZE=args.dqn_bs)

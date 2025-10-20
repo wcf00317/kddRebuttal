@@ -1,13 +1,13 @@
-# videomae_configs/ebm_hmdb51_base.yaml
+# videomae_configs/ebm_ucf101_base.yaml
 
 # ===================================================================
 #                       通用配置
 # ===================================================================
-dataset: hmdb51
-data_path: ../hmdb51
+dataset: ucf101
+data_path: ../ucf101
 ckpt_path: ./checkpoints
-exp_name: videomaev2_base_ebm_hmdb51 # 实验名
-model_type: videomae                 # <-- 关键: 指定模型为videomae
+exp_name: videomaev2_base_ebm_ucf101 # 实验名
+model_type: videomae                # <-- 关键: 指定模型为videomae
 seed: 42
 
 # --- 数据处理 & 模型配置 ---
@@ -17,15 +17,15 @@ workers: 8
 clip_len: 16
 model_cfg_path: ../mmaction2/configs/recognition/videomaev2/vit-base-p16_videomaev2-vit-g-dist-k710-pre_16x4x1_kinetics-400.py
 model_ckpt_path: "../pretrained_checkpoints/vit-base-p16_videomaev2-vit-g-dist-k710-pre_16x4x1_kinetics-400_20230510-3e7f93b2.pth"
-num_classes: 51
+num_classes: 101
 embed_dim: 768
 
 # ===================================================================
 #             阶段 1: 特征两端提取法
 # ===================================================================
 initial_labeled_ratio: 0.05
-budget_labels: 578
-num_each_iter: 20 # EBM方法通常每轮评估多个策略，可以适当减少num_each_iter
+budget_labels: 1000
+num_each_iter: 20
 
 # --- 启用的特征策略 (用于生成best/worst对) ---
 use_statistical_features: true
@@ -48,7 +48,7 @@ al_algorithm: dqn
 # --- 训练设置 (使用AdamW优化器, 20个收敛周期) ---
 optimizer:
   type: 'SGD'
-  lr: 0.00005
+  lr: 0.001
   weight_decay: 0.05
 epoch_num: 100
 patience: 20

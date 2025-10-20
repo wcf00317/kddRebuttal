@@ -63,7 +63,9 @@ def main(args):
     # --- 3. 加载全量数据 ---
     # 注意：这里我们不再需要candidate_set，并且train_set会包含所有训练视频
     # initial_labeled_ratio 设置为1.0来加载所有训练数据
-    _, train_set, val_loader, _ = get_data(
+    # _, train_set, val_loader, _ = get_data(
+    full_train_loader,     _, val_loader, _ = get_data(
+
         data_path=args.data_path,
         tr_bs=args.train_batch_size,
         vl_bs=args.val_batch_size,
@@ -71,11 +73,11 @@ def main(args):
         model_type=args.model_type,
         n_workers=args.workers,
         clip_len=args.clip_len,
-        initial_labeled_ratio=1.0  # 加载100%的训练数据
+        initial_labeled_ratio=0.1  # 加载100%的训练数据
     )
     # 创建一个包含所有样本的DataLoader
-    full_train_loader = DataLoader(train_set, batch_size=args.train_batch_size, shuffle=True,
-                                   num_workers=args.workers, drop_last=False)
+    # full_train_loader = DataLoader(train_set, batch_size=args.train_batch_size, shuffle=True,
+                                #    num_workers=args.workers, drop_last=False)
 
     # --- 4. 设置优化器和日志 ---
     optimizer = create_and_load_optimizers(net=net, opt_choice=args.optimizer, lr=args.lr,
