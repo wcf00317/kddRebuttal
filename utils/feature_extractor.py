@@ -74,16 +74,6 @@ class UnifiedFeatureExtractor:
             self.feature_dim_names.extend(['mean_temporal_inconsistency', 'std_temporal_inconsistency'])
             print("  - Temporal Consistency Feature: ENABLED")
 
-        # 交叉视角一致性
-        if getattr(args, 'use_cross_view_consistency_feature', False):
-            self.active_features.append('cross_view_consistency')
-            self.feature_dim += 2
-            # <--- 新增下面这行: 添加交叉视角一致性特征的名称 ---
-            self.feature_dim_names.extend(['mean_crossview_inconsistency', 'std_crossview_inconsistency'])
-            print("  - Cross-View Consistency Feature: ENABLED")
-
-        # **重要提示**: 请确保为您自己添加的任何其他特征，也在这里添加相应的 feature_dim_names.extend() 或 .append()。
-        #            添加的名称顺序必须严格对应于您在 extract 方法中拼接特征的顺序。
 
         if not self.active_features:
             raise ValueError("错误：至少需要启用一种特征！请检查您的配置文件。")
@@ -100,13 +90,27 @@ class UnifiedFeatureExtractor:
         feature_tensors = []
 
         if 'statistical' in self.active_features:
-            # --- MODIFIED: 从 probs 计算熵 ---
-            entropies = (-torch.sum(batch_probs * torch.log(batch_probs + 1e-8), dim=1)).tolist()
-            batch_similarities = [0.5] * len(batch_video_indices)
-            mean_entropy = sum(entropies) / len(entropies)
-            std_entropy = torch.std(torch.tensor(entropies)).item() if len(entropies) > 1 else 0
-            mean_similarity = sum(batch_similarities) / len(batch_similarities)
-            std_similarity = torch.std(torch.tensor(batch_similarities)).item() if len(batch_similarities) > 1 else 0
+            # --- 熵：用概率分布计算 per-sample entropy，然后做批内聚合 ---
+            probs = torch.clamp(batch_probs, min=1e-8, max=1.0)  # 数值安全
+            entropies = -(probs * probs.log()).sum(dim=1)  # [B]
+            mean_entropy = entropies.mean().item()
+            std_entropy = entropies.std().item() if entropies.numel() > 1 else 0.0
+
+            # --- 相似度：批内两两余弦相似度的上三角均值/方差 ---
+            emb2d = batch_embeddings
+            if emb2d.dim() > 2:  # 聚合到 [B, C]
+                emb2d = emb2d.mean(dim=tuple(range(2, emb2d.dim())))
+            if emb2d.size(0) > 1:
+                normed = F.normalize(emb2d, p=2, dim=1)
+                cos = normed @ normed.t()  # [B, B]
+                iu = torch.triu_indices(emb2d.size(0), emb2d.size(0), offset=1)
+                sims = cos[iu[0], iu[1]]  # 上三角（不含对角）
+                mean_similarity = sims.mean().item()
+                std_similarity = sims.std().item() if sims.numel() > 1 else 0.0
+            else:
+                mean_similarity, std_similarity = 0.0, 0.0
+
+            # 维度仍然是 4： [mean_entropy, std_entropy, mean_similarity, std_similarity]
             feature_tensors.append(torch.tensor([mean_entropy, std_entropy, mean_similarity, std_similarity]))
 
         if 'diversity' in self.active_features:
@@ -130,7 +134,8 @@ class UnifiedFeatureExtractor:
         if 'neighborhood_density' in self.active_features:
             density_score = 0.0
             if all_unlabeled_embeddings is not None and len(all_unlabeled_embeddings) > 1:
-                dist_matrix = torch.cdist(batch_embeddings.cpu(), all_unlabeled_embeddings.cpu())
+                #dist_matrix = torch.cdist(batch_embeddings.cpu(), all_unlabeled_embeddings.cpu())
+                dist_matrix = torch.cdist(batch_embeddings.to(device), all_unlabeled_embeddings.to(device))
                 k = min(10, len(all_unlabeled_embeddings))
                 knn_dists = torch.topk(dist_matrix, k, largest=False, dim=1).values
                 mean_knn_dist = knn_dists.mean().item()
@@ -153,7 +158,8 @@ class UnifiedFeatureExtractor:
             std_dist = 0.0
             if all_labeled_embeddings is not None and len(all_labeled_embeddings) > 0:
                 # 计算批内每个样本到已标注集的最短距离
-                dist_matrix = torch.cdist(batch_embeddings.cpu(), all_labeled_embeddings.cpu())
+                #dist_matrix = torch.cdist(batch_embeddings.cpu(), all_labeled_embeddings.cpu())
+                dist_matrix = torch.cdist(batch_embeddings.to(device), all_labeled_embeddings.to(device))
                 min_dists, _ = torch.min(dist_matrix, dim=1)
                 mean_dist = min_dists.mean().item()
                 std_dist = min_dists.std().item() if len(min_dists) > 1 else 0.0
@@ -217,15 +223,31 @@ class UnifiedFeatureExtractor:
         # --- 提取当前批次的基础信息 ---
         batch_embeddings, batch_probs = self.get_embeddings_and_probs(batch_video_indices, model, train_set)
 
-        # --- 从传入的 batch_scores 字典中获取并聚合特征 ---
         if 'statistical' in self.active_features:
-            entropies = -torch.sum(batch_probs * torch.log(batch_probs + 1e-8), dim=1)
-            similarities = torch.tensor([0.5] * len(batch_video_indices))  # 简化版
-            feature_tensors.append(torch.tensor([
-                entropies.mean().item(), entropies.std().item() if len(entropies) > 1 else 0.0,
-                similarities.mean().item(), similarities.std().item() if len(similarities) > 1 else 0.0,
-            ]))
+            # 1) 批内熵的均值/方差（数值更稳）
+            probs = torch.clamp(batch_probs, min=1e-8, max=1.0)
+            entropies = -(probs * probs.log()).sum(dim=1)  # [B]
+            mean_entropy = entropies.mean().item()
+            std_entropy = entropies.std().item() if entropies.numel() > 1 else 0.0
 
+            # 2) 批内两两余弦相似度的均值/方差（替代原来的 0.5 占位）
+            emb2d = batch_embeddings
+            if emb2d.dim() > 2:  # 聚合到 [B, C]
+                emb2d = emb2d.mean(dim=tuple(range(2, emb2d.dim())))
+            B = emb2d.size(0)
+            if B > 1:
+                normed = F.normalize(emb2d, p=2, dim=1, eps=1e-8)
+                cos = normed @ normed.t()  # [B, B]
+                iu = torch.triu_indices(B, B, offset=1)  # 上三角(不含对角)
+                sims = cos[iu[0], iu[1]]
+                mean_similarity = sims.mean().item()
+                std_similarity = sims.std().item() if sims.numel() > 1 else 0.0
+            else:
+                mean_similarity, std_similarity = 0.0, 0.0
+
+            feature_tensors.append(torch.tensor([
+                mean_entropy, std_entropy, mean_similarity, std_similarity
+            ]))
         # 所有其他策略都直接从 batch_scores 中获取结果
         if 'diversity' in self.active_features:
             # 多样性是批次内计算的，不依赖外部 precomputed_data
@@ -253,7 +275,6 @@ class UnifiedFeatureExtractor:
             'labeled_distance': 'labeled_distance',
             'neighborhood_density': 'neighborhood_density',
             'temporal_consistency': 'temporal_consistency',
-            'cross_view_consistency': 'cross_view_consistency'
         }
 
         for feature_name, score_key in aggregation_map.items():
@@ -319,25 +340,6 @@ class UnifiedFeatureExtractor:
                 batch_probs.append(probs)
 
         return torch.cat(batch_embeddings, dim=0), torch.cat(batch_probs, dim=0)
-    # --- MODIFIED: 重命名函数并返回 probs ---
-    # def get_embeddings_and_probs(self, video_indices, model, train_set):
-    #     model.eval()
-    #     batch_embeddings = []
-    #     batch_probs = []  # --- MODIFIED ---
-    #
-    #     with torch.no_grad():
-    #         for vid_idx in video_indices:
-    #             video_tensor = train_set.get_video(vid_idx).cuda()
-    #             video_tensor = video_tensor.unsqueeze(0).cuda()
-    #             features = model.extract_feat(video_tensor)[0]
-    #             if features.shape[0] > 1: features = features.mean(dim=0, keepdim=True)
-    #             batch_embeddings.append(features)
-    #             logits = model.cls_head(features)
-    #             probs = F.softmax(logits, dim=1)
-    #             batch_probs.append(probs)  # --- MODIFIED: 存储 probs 而不是 entropy ---
-    #
-    #     return torch.cat(batch_embeddings, dim=0), torch.cat(batch_probs, dim=0)
-
 
 def get_all_unlabeled_embeddings(args, model, train_set):
     # ... (此函数保持不变) ...
@@ -351,27 +353,6 @@ def get_all_unlabeled_embeddings(args, model, train_set):
             batch_indices = unlabeled_indices[i:i + batch_size]
             videos = [train_set.get_video(idx) for idx in batch_indices]
             video_batch_tensor = torch.cat(videos, dim=0).cuda()
-    #                     # --- DEBUG PRINT 1 ---
-    #         print(f"\n[DEBUG] Shape after torch.cat: {video_batch_tensor.shape}")
-
-    #         video_batch_tensor = video_batch_tensor.unsqueeze(0).cuda() # <-- 怀疑点
-
-    #         # --- DEBUG PRINT 2 ---
-    #         print(f"[DEBUG] Shape after unsqueeze(0) before model.extract_feat: {video_batch_tensor.shape}")
-
-    #         features = model.extract_feat(video_batch_tensor)[0]
-
-    #         # --- DEBUG PRINT 3 ---
-    #         print(f"[DEBUG] Shape of 'features' from model.extract_feat: {features.shape}")
-
-    #         if features.dim() > 2: features = features.mean(dim=0)
-            
-    #         # --- DEBUG PRINT 4 ---
-    #         print(f"[DEBUG] Shape of 'features' after potential mean(): {features.shape}")
-    #         all_embeddings.append(features.cpu())
-    # return torch.cat(all_embeddings, dim=0) if all_embeddings else None
-
-
             video_batch_tensor = video_batch_tensor.unsqueeze(0).cuda()
             features = model.extract_feat(video_batch_tensor)[0]
             if features.dim() > 2: features = features.mean(dim=0)
@@ -408,4 +389,3 @@ def get_all_labeled_embeddings(args, model, train_set):
             all_embeddings.append(features.cpu())
 
     return torch.cat(all_embeddings, dim=0) if all_embeddings else None
-# --- NEW: 结束 ---

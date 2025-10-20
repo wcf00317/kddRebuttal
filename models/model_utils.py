@@ -382,179 +382,86 @@ import time
 
 def compute_state_for_har(args, model, train_set, candidate_video_indices, labeled_video_indices=None):
     """
-    【熵奖励修正版】
-    此版本同时计算4096维特征嵌入（用于状态）和每个视频的熵（用于奖励模型训练数据），
-    并作为三个独立的变量返回，以匹配 run.py 中的调用。
+    返回:
+      state = {
+        'pool':   [N, D]  # 候选池每个样本的 embedding（4096等），已做时空均值
+        'subset': [1, D]  # 已标注集的聚合表示（均值）
+      }
+      candidate_video_indices: 原样返回
+      candidate_entropies:     list[float]，每个候选样本的熵
+    约定:
+      - 仅一次前向: extract_feat -> cls_head -> softmax 计算熵
+      - 仅当输入是4维 [C,T,H,W] 才 unsqueeze 到 [1,C,T,H,W]；5维 [N,C,T,H,W] 直接用
+      - 全部返回 CPU 张量; 后续在优化器/推入buffer时统一搬到 device
     """
     s = time.time()
-    print('Computing state (4096-dim embeddings) AND entropy for reward calculation...')
+    print('Computing state (embeddings + entropy) ...')
     model.eval()
 
-    # --- 新增：初始化两个列表，分别存储特征和熵 ---
-    state_pool_features = []
-    candidate_entropies = []
+    pool_feats   = []
+    pool_entropies = []
 
-    # --------------------------------------------------------------------
-    # 内部辅助函数现在需要同时返回特征和熵
-    def _get_feature_and_entropy_for_single_video(vid_idx):
-        video_tensor = train_set.get_video(vid_idx)
-        video_tensor = video_tensor.unsqueeze(0).cuda()
+    def _forward_one(vid_idx):
+        # 取视频张量
+        vt = train_set.get_video(vid_idx)  # 形如 [C,T,H,W] 或 [N,C,T,H,W]
+        if vt.dim() == 4:   # [C,T,H,W] -> [1,C,T,H,W]
+            vt = vt.unsqueeze(0)
+        # 若已是 [N,C,T,H,W] 则不动
+        vt = vt.cuda(non_blocking=True)
 
         with torch.no_grad():
-            # 1. 为了计算熵，我们仍然需要做一次完整的分类前向传播来获取概率
-            # print(video_tensor.shape)
-            logits = model(video_tensor, return_loss=False)
-            logits = model.cls_head(logits)
-            if logits.shape[0] > 1:
-                logits = logits.mean(dim=0, keepdim=True)
+            # 一次前向：先拿 embedding
+            feats = model.extract_feat(vt)  # 通常返回 list/tuple，或 [N,C',T',H',W']
+            if isinstance(feats, (list, tuple)):
+                feats = feats[0]
+            # 时空均值 -> [N, D]
+            while feats.dim() > 2:
+                feats = feats.mean(dim=-1)
+            # 如果前面是 [N, D]，ok；如果是 [D]（少见），补 batch 维
+            if feats.dim() == 1:
+                feats = feats.unsqueeze(0)
 
-            probs = F.softmax(logits, dim=1)
-            entropy = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).item()
+            # logits 来自 cls_head(feats)
+            logits = model.cls_head(feats)  # [N, num_classes]
+            probs  = F.softmax(logits, dim=1)
+            # 每个 clip 的熵
+            ent = (-probs * torch.log(probs + 1e-8)).sum(dim=1)  # [N]
 
-            # 2. 获取4096维特征用于状态表示
-            features = model.extract_feat(video_tensor)[0]
-            if features.shape[0] > 1:
-                features = features.mean(dim=0, keepdim=True)
+            # 如果 get_video 返回了多 clip（N>1），我们按你之前习惯对 N 做均值聚合成单向量
+            if feats.size(0) > 1:
+                feats = feats.mean(dim=0, keepdim=True)  # [1, D]
+                ent   = ent.mean(dim=0, keepdim=True)    # [1]
 
-            if features.ndim == 5:
-                features = features.mean(dim=(2, 3, 4))
-            elif features.ndim == 4:
-                features = features.mean(dim=(2, 3))
-            elif features.ndim == 3:
-                features = features.mean(dim=2)
+            return feats.squeeze(0).cpu(), float(ent.item())
 
-            if features.dim() == 1:
-                features = features.unsqueeze(0)
-
-            # 同时返回特征和熵
-            return features, entropy
-
-    # --------------------------------------------------------------------
-
-    # 1. 计算未标注视频池的状态和熵
+    # 1) 候选池
     if candidate_video_indices:
-        for vid_idx in candidate_video_indices:
-            # 接收特征和熵两个返回值
-            feature, entropy = _get_feature_and_entropy_for_single_video(vid_idx)
-            state_pool_features.append(feature)
-            # 将熵存入列表
-            candidate_entropies.append(entropy)
+        for vid in candidate_video_indices:
+            f, e = _forward_one(vid)
+            pool_feats.append(f)       # f: [D] (CPU)
+            pool_entropies.append(e)   # float
 
-    state_pool_tensor = torch.cat(state_pool_features, dim=0) if state_pool_features else torch.empty(0, args.embed_dim)
-
-    # 2. 计算已标注视频子集的状态 (这部分逻辑不变，我们只需要特征)
-    if labeled_video_indices:
-        state_subset_features = []
-        for vid_idx in labeled_video_indices:
-            # 在这里我们只需要特征，可以忽略熵的返回值
-            feature, _ = _get_feature_and_entropy_for_single_video(vid_idx)
-            state_subset_features.append(feature)
-
-        all_subset_features = torch.cat(state_subset_features, dim=0)
-        fixed_size_subset_tensor = torch.mean(all_subset_features, dim=0, keepdim=True)
+    if len(pool_feats) > 0:
+        pool_tensor = torch.stack(pool_feats, dim=0)  # [N, D] (CPU)
     else:
-        fixed_size_subset_tensor = torch.zeros(1, args.embed_dim, device='cuda')
+        pool_tensor = torch.empty(0, args.embed_dim)
 
-    # 3. 构建最终的状态字典
-    all_state = {'pool': state_pool_tensor.cpu(), 'subset': fixed_size_subset_tensor.cpu()}
+    # 2) 已标注集 -> [1,D]
+    if labeled_video_indices:
+        sub_feats = []
+        for vid in labeled_video_indices:
+            f, _ = _forward_one(vid)
+            sub_feats.append(f)
+        subset_tensor = torch.stack(sub_feats, dim=0).mean(dim=0, keepdim=True)  # [1, D]
+    else:
+        subset_tensor = torch.zeros(1, args.embed_dim)  # [1, D] on CPU
 
-    print(f'State and entropies computed! Pool shape: {all_state["pool"].shape}. Time: {time.time() - s:.2f}s')
+    state = {'pool': pool_tensor, 'subset': subset_tensor}
 
-    # --- 核心修改：返回三个值 ---
-    return all_state, candidate_video_indices, candidate_entropies
+    print(f'State OK. pool={tuple(state["pool"].shape)}, subset={tuple(state["subset"].shape)}; '
+          f'took {time.time()-s:.2f}s')
 
-# def compute_state_for_har(args, model, train_set, candidate_video_indices, labeled_video_indices=None):
-#     """
-#     计算RL状态的【逐一处理修正版】。
-#     此版本修复了参数和设备bug，但为了调试方便，恢复了逐一处理视频的逻辑。
-#     注意：此版本运行速度会比批处理版本慢很多。
-#
-#     :param args: 参数对象
-#     :param model: MMAction2 视频分类模型
-#     :param train_set: 完整的数据集对象
-#     :param candidate_video_indices: List[int]，候选未标注视频ID。
-#     :param labeled_video_indices: List[int]，可选，已标注视频的ID列表。
-#     :return:
-#         all_state: dict, 包含 'pool' 和 'subset' 的状态特征张量。
-#         candidate_video_indices: 原样返回。
-#     """
-#     s = time.time()
-#     print('Computing state (single item processing for debugging)...')
-#     model.eval()
-#
-#
-#     # --------------------------------------------------------------------
-#     # 为了避免代码重复，我们先定义一个处理单个视频的内部辅助函数
-#     def _get_feature_for_single_video(vid_idx):
-#         # 统一使用 train_set 的 get_video 方法，它应该返回一个简单的 [C, T, H, W] 张量
-#         video_tensor = train_set.get_video(vid_idx)
-#         # 增加批次维度(B=1)，并移动到 CUDA
-#         video_tensor = video_tensor.unsqueeze(0).cuda()
-#
-#         with torch.no_grad():
-#             # 为模型准备输入
-#             # video_tensor = video_tensor.unsqueeze(1)
-#             logits = model(video_tensor, return_loss=False)
-#             if logits.shape[0] > 1:  # 如果有多个clips
-#                 # 在进行softmax之前，先对logits求平均
-#                 logits = logits.mean(dim=0, keepdim=True)  # 形状变为 [1, num_classes]
-#
-#             probs = F.softmax(logits, dim=1)
-#
-#             # 特征计算
-#             entropy_val = -torch.sum(probs * torch.log(probs + 1e-8), dim=1).item()
-#             max_prob_val = torch.max(probs).item()
-#
-#             # 拼接特征向量 (所有张量都在GPU上，无设备冲突)
-#             # print(entropy_val.shape, max_prob_val.shape)
-#             feature_vector = probs.squeeze(0)#torch.cat(
-#                 #[torch.tensor([entropy_val, max_prob_val], device=probs.device), probs.squeeze(0)], dim=0)
-#             # print(feature_vector.shape)
-#             # print("=================")
-#             # 返回一个 [1, D] 形状的张量，方便后续拼接
-#             return feature_vector.unsqueeze(0)
-#
-#     # --------------------------------------------------------------------
-#
-#     # 1. 计算未标注视频池的状态
-#     state_pool_features = []
-#     if candidate_video_indices:
-#         for vid_idx in candidate_video_indices:
-#             feature = _get_feature_for_single_video(vid_idx)
-#             state_pool_features.append(feature)
-#
-#     state_pool_tensor = torch.cat(state_pool_features, dim=0) if state_pool_features else torch.empty(0,
-#                                                                                                       args.num_classes + 2)
-#
-#     # 2. 计算已标注视频子集的状态
-#     if labeled_video_indices:
-#         state_subset_features = []
-#         for vid_idx in labeled_video_indices:
-#             feature = _get_feature_for_single_video(vid_idx)
-#             state_subset_features.append(feature)
-#
-#         # ✅ 首先，像原来一样拼接成一个 [num_labeled, num_classes] 的大张量
-#         all_subset_features = torch.cat(state_subset_features, dim=0)
-#
-#         # ✅ 然后，对所有已标注视频的特征取平均值，聚合成一个单一的向量
-#         # keepdim=True 确保输出形状是 [1, num_classes] 而不是 [num_classes]
-#         fixed_size_subset_tensor = torch.mean(all_subset_features, dim=0, keepdim=True)
-#     else:
-#         # 如果没有任何已标注视频，返回一个正确形状的零向量
-#         fixed_size_subset_tensor = torch.zeros(1, args.num_classes, device='cuda')
-#
-#     # state_subset_tensor = torch.cat(state_subset_features, dim=0) if state_subset_features else torch.empty(0,
-#     #                                                                                                        args.num_classes + 2)
-#
-#     # 3. 构建最终的状态字典
-#     # all_state = {'pool': state_pool_tensor.cpu(), 'subset': state_subset_tensor.cpu()}
-#     all_state = {'pool': state_pool_tensor.cpu(), 'subset': fixed_size_subset_tensor.cpu()}
-#
-#     print(f'State computed! Pool shape: {all_state["pool"].shape}, Subset shape: {all_state["subset"].shape}. Time: {time.time() - s:.2f}s')
-#
-#
-#     return all_state, candidate_video_indices
-
+    return state, candidate_video_indices, pool_entropies
 def add_labeled_videos(args, list_existing_videos, videos_to_label_ids, train_set, budget, n_ep):
     """
     此函数将指定视频列表添加到已标注数据集和已存在视频列表中。
@@ -794,443 +701,170 @@ def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimi
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    print("\n=== [DEBUG] Enter optimize_model_conv ===")
-    print(f"len(memory): {len(memory)}, BATCH_SIZE: {BATCH_SIZE}")
-
     if len(memory) < BATCH_SIZE:
-        print("[DEBUG] Memory not enough, skipping update.")
         return
 
-    # ---- Sample ----
+    # -------------------- Sample a minibatch --------------------
     transitions = memory.sample(BATCH_SIZE)
     batch = Transition(*zip(*transitions))
 
-    if random.random() < 0.02:
-        print("[DEBUG] Sample example:]")
-        ex_r = batch.reward[0].item() if torch.is_tensor(batch.reward[0]) else batch.reward[0]
-        print("  reward:", ex_r)
-        print("  action:", batch.action[0])
-        print("  state_pool shape:", tuple(batch.state_pool[0].shape) if torch.is_tensor(batch.state_pool[0]) else None)
-        print("  next_state_pool is None?", batch.next_state_pool[0] is None)
-
-    # ---- Masks ----
-    non_final_mask = torch.tensor(tuple(s is not None for s in batch.next_state_pool),
-                                  device=device, dtype=torch.bool)
-    print("[DEBUG] non_final_mask shape:", tuple(non_final_mask.shape),
-          "sum:", int(non_final_mask.sum().item()))
-
-    # ---- Batches ----
-    state_batch_pool   = torch.cat(batch.state_pool).to(device)         # [B,D] or [B,1,D]
-    state_batch_subset = torch.cat(batch.state_subset).to(device)       # [B,M,D] or [B,1,1,D] or [B,D]
-
-    # x -> [B,D]
-    if state_batch_pool.dim() == 3 and state_batch_pool.size(1) == 1:
-        state_batch_pool = state_batch_pool.squeeze(1)
+    # ---------- Build current (s,a) batch ----------
+    # state_pool: 每条是“被选样本的embedding”，形状可能是 [D] 或 [1,D]
+    if torch.is_tensor(batch.state_pool[0]) and batch.state_pool[0].dim() == 1:
+        state_batch_pool = torch.stack(batch.state_pool, dim=0).to(device)   # [B, D]
+    else:
+        # 兼容 [1,D] 的情况
+        state_batch_pool = torch.cat(batch.state_pool, dim=0).to(device)     # [B,1,D] or [B,D]
+        if state_batch_pool.dim() == 3 and state_batch_pool.size(1) == 1:
+            state_batch_pool = state_batch_pool.squeeze(1)                   # -> [B, D]
     assert state_batch_pool.dim() == 2, f"state_batch_pool should be [B,D], got {state_batch_pool.shape}"
 
-    # subset -> [B,M,D]
+    # state_subset: 每条是 [1,M,D] 或 [M,D]
+    state_batch_subset = torch.cat(batch.state_subset, dim=0).to(device)     # [B,1,M,D] or [B,M,D] or [B,D]
     while state_batch_subset.dim() > 3:
-        state_batch_subset = state_batch_subset.squeeze(1)
+        state_batch_subset = state_batch_subset.squeeze(1)                   # 去掉多余的1维
     if state_batch_subset.dim() == 2:
-        state_batch_subset = state_batch_subset.unsqueeze(1)
-    elif state_batch_subset.dim() == 3 and state_batch_subset.size(1) == 0:
-        state_batch_subset = state_batch_subset.reshape(state_batch_subset.size(0), 1, state_batch_subset.size(-1))
-    assert state_batch_subset.dim() == 3, f"state_batch_subset should be [B,M,D], got {state_batch_subset.shape}"
+        state_batch_subset = state_batch_subset.unsqueeze(1)                 # [B,1,D] -> [B,1,D] (容错)
+    assert state_batch_subset.dim() == 3, f"state_batch_subset must be [B,M,D], got {state_batch_subset.shape}"
 
-    action_batch = torch.cat([a.unsqueeze(0) for a in batch.action]).to(device)  # [B]
-    reward_batch = torch.cat([r.unsqueeze(0) for r in batch.reward]).to(device)  # [B]
+    # action：当前实现未用到，但保留以便debug
+    action_batch = torch.stack(
+        [a if torch.is_tensor(a) else torch.tensor(a) for a in batch.action], dim=0
+    ).to(device)  # [B]
 
-    print("[DEBUG] state_batch_pool:", tuple(state_batch_pool.shape))
-    print("[DEBUG] state_batch_subset:", tuple(state_batch_subset.shape))
-    print("[DEBUG] action_batch:", tuple(action_batch.shape),
-          "min:", float(action_batch.min().item()), "max:", float(action_batch.max().item()))
-    r_min, r_max, r_std = float(reward_batch.min().item()), float(reward_batch.max().item()), float(reward_batch.std().item())
-    print("[DEBUG] reward_batch:", tuple(reward_batch.shape), "min:", r_min, "max:", r_max, "std:", r_std)
-    if r_std < 1e-6:
-        print("[WARN] Reward variance too small -> 模型很难学到差异。请检查 reward 设计。")
+    # reward：推的是标量（0-D）就行，这里统一成 [B]
+    reward_elems = []
+    for r in batch.reward:
+        if torch.is_tensor(r):
+            reward_elems.append(r.reshape(()))  # 保证0-D
+        else:
+            reward_elems.append(torch.tensor(r, dtype=torch.float))
+    reward_batch = torch.stack(reward_elems, dim=0).to(device)  # [B]
 
-    # ---- Q(s,a) ----
+    # -------------------- Q(s,a) --------------------
+    # policy_net 接口： (x=[B,D], subset=[B,M,D]) -> [B] or [B,1]
     q_sa = policy_net(state_batch_pool, state_batch_subset)
     if q_sa.dim() == 2 and q_sa.size(1) == 1:
         q_sa = q_sa.squeeze(1)
-    q_sa = torch.nan_to_num(q_sa, nan=0.0, posinf=1e6, neginf=-1e6)
-    print("[DEBUG] q_sa shape:", tuple(q_sa.shape),
-          "min:", float(q_sa.min().item()), "max:", float(q_sa.max().item()))
+    q_sa = torch.nan_to_num(q_sa, nan=0.0, posinf=1e6, neginf=-1e6)  # 数值保护
+    assert q_sa.shape == reward_batch.shape, f"q_sa shape {q_sa.shape} vs reward {reward_batch.shape}"
 
-    # ---- target: max_{a'} Q_target(s',a') ----
+    # -------------------- target: max_{a'} Q_target(s',a') --------------------
     next_state_values = torch.zeros(BATCH_SIZE, device=device)
 
+    # mask：哪些transition有下一个状态
+    non_final_mask = torch.tensor(tuple(s is not None for s in batch.next_state_pool),
+                                  device=device, dtype=torch.bool)
     if non_final_mask.any():
+        # 收集非终止样本的 next_subset / next_pool
         nf_next_subset_list = [s for s in batch.next_state_subset if s is not None]
         nf_next_pool_list   = [p for p in batch.next_state_pool   if p is not None]
 
-        # subset_nf -> [B_nf,M,D]
-        nf_next_subset = torch.cat(nf_next_subset_list).to(device)
+        # next_subset -> [B_nf, M, D]
+        nf_next_subset = torch.cat(nf_next_subset_list, dim=0).to(device)
         while nf_next_subset.dim() > 3:
             nf_next_subset = nf_next_subset.squeeze(1)
         if nf_next_subset.dim() == 2:
-            nf_next_subset = nf_next_subset.unsqueeze(1)
+            nf_next_subset = nf_next_subset.unsqueeze(0)  # [1,M,D] -> [1,M,D]
         assert nf_next_subset.dim() == 3, f"nf_next_subset must be [B_nf,M,D], got {nf_next_subset.shape}"
 
-        # 尝试批量路径：要求所有样本的 K 相同
+        # 我们希望 next_pool 统一为 [B_nf, K, D]；K 可变时用padding或逐样本fallback
         try:
-            # 预检查：打印每个样本的 K 以便诊断
             ks = []
-            for idx, p in enumerate(nf_next_pool_list):
-                shape = tuple(p.shape)
-                # 兼容 [1,K,D] / [K,D] / [1,1,K,D]
-                if len(shape) == 4 and shape[1] == 1:
-                    k_i = shape[2]
-                elif len(shape) == 3:
-                    k_i = shape[1]
-                elif len(shape) == 2:
-                    k_i = 1
-                else:
-                    raise RuntimeError(f"Unexpected next_state_pool item shape: {shape}")
-                ks.append(k_i)
-            if len(set(ks)) != 1 and not use_padding:
-                raise RuntimeError(f"Variable K in batch (ks={ks}) and use_padding=False")
-
-            # 统一到 [B_nf,K,D]
             normed = []
-            max_k = max(ks)
             for p in nf_next_pool_list:
                 x = p.to(device)
+                # 兼容 [1,K,D] / [K,D] / [1,1,D] / [D]
                 if x.dim() == 4 and x.size(1) == 1:
-                    x = x.squeeze(1)               # [1,K,D] -> [K,D]
-                if x.dim() == 2:
-                    x = x.unsqueeze(0)             # [D] or [K,D]? if [D], becomes [1,D] then next line handles
-                if x.dim() == 2 and x.size(0) != 1:  # [K,D] already; make it [1,K,D]
-                    x = x.unsqueeze(0)
-                if x.dim() == 2 and x.size(0) == 1:  # [1,D] -> [1,1,D]
-                    x = x.unsqueeze(1)
-                if x.dim() == 3 and x.size(1) == 0:
-                    x = x.reshape(1, 1, x.size(-1))
-                # padding（可选）
-                if use_padding and x.size(1) < max_k:
-                    pad_k = max_k - x.size(1)
-                    x = F.pad(x, (0, 0, 0, pad_k))  # pad K dimension with zeros
-                normed.append(x)  # [1,K,D]
-            nf_next_pool = torch.cat(normed, dim=0)  # [B_nf,K,D]
+                    x = x.squeeze(1)            # [1,K,D] -> [K,D]
+                if x.dim() == 1:
+                    x = x.unsqueeze(0)          # [D] -> [1,D]
+                if x.dim() == 2 and x.size(0) == 1:
+                    # [1,D] 视作单动作
+                    k_i = 1
+                    x = x.unsqueeze(1)          # -> [1,1,D]
+                elif x.dim() == 2:
+                    # [K,D]
+                    k_i = x.size(0)
+                    x = x.unsqueeze(0)          # -> [1,K,D]
+                elif x.dim() == 3:
+                    # [1,K,D]
+                    k_i = x.size(1)
+                else:
+                    raise RuntimeError(f"Unexpected next_pool shape: {tuple(x.shape)}")
+                ks.append(k_i)
+                normed.append(x)
 
+            max_k = max(ks)
+            if len(set(ks)) != 1 and not use_padding:
+                raise RuntimeError(f"Variable K={ks} and use_padding=False")
+
+            # padding到同一K
+            pads = []
+            for x, k_i in zip(normed, ks):
+                if use_padding and k_i < max_k:
+                    pad_k = max_k - k_i
+                    x = F.pad(x, (0, 0, 0, pad_k))  # pad K 维
+                pads.append(x)
+            nf_next_pool = torch.cat(pads, dim=0)            # [B_nf, K, D]
+
+            # 批量算 Q_target(s', a')，并在K上取max
             B_nf, K, D = nf_next_pool.shape
-            flat_next_x = nf_next_pool.reshape(B_nf * K, D)
+            flat_next_x = nf_next_pool.reshape(B_nf * K, D)  # [B_nf*K, D]
             rep_next_subset = nf_next_subset.unsqueeze(1).expand(B_nf, K, *nf_next_subset.shape[1:]) \
                                                .reshape(B_nf * K, *nf_next_subset.shape[1:])
             with torch.no_grad():
-                q_next_all = target_net(flat_next_x, rep_next_subset).reshape(B_nf, K)
+                q_next_all = target_net(flat_next_x, rep_next_subset).reshape(B_nf, K)  # [B_nf,K]
                 q_next_all = torch.nan_to_num(q_next_all, nan=0.0, posinf=1e6, neginf=-1e6)
-                # 对 padding 的 0 向量（若启用 padding）做屏蔽：置为 -inf
                 if use_padding and len(set(ks)) != 1:
                     valid_mask = torch.arange(K, device=device).unsqueeze(0) < torch.tensor(ks, device=device).unsqueeze(1)
                     q_next_all = q_next_all.masked_fill(~valid_mask, float('-inf'))
-                q_next_max = q_next_all.max(dim=1).values
-
+                q_next_max = q_next_all.max(dim=1).values  # [B_nf]
             next_state_values[non_final_mask] = q_next_max
-            print("[DEBUG] q_next_all:", tuple(q_next_all.shape),
-                  "q_next_max min/max:", float(q_next_max.min().item()), float(q_next_max.max().item()))
 
-        except RuntimeError as e:
-            # 逐样本安全路径（可变 K）
-            print("[WARN] Batch has variable K or shape mismatch; fallback per-sample. err:", e)
+        except RuntimeError:
+            # 逐样本fallback（K可变时）
+            q_next_max_list = []
             with torch.no_grad():
-                # 注意：这里的顺序与 nf_next_pool_list 一一对应
-                q_next_max_list = []
-                for j, (pool_j, subset_j) in enumerate(zip(nf_next_pool_list, nf_next_subset_list)):
+                for pool_j, subset_j in zip(nf_next_pool_list, nf_next_subset_list):
                     pj = pool_j.to(device)
                     sj = subset_j.to(device)
-                    # subset -> [1,M,D]
                     while sj.dim() > 3:
                         sj = sj.squeeze(1)
                     if sj.dim() == 2:
-                        sj = sj.unsqueeze(0)
-                    # pool -> [Kj,D]
+                        sj = sj.unsqueeze(0)  # [1,M,D]
+
                     if pj.dim() == 4 and pj.size(1) == 1:
-                        pj = pj.squeeze(1)     # [1,K,D] -> [K,D]
+                        pj = pj.squeeze(1)   # [1,K,D] -> [K,D]
                     if pj.dim() == 3 and pj.size(0) == 1:
-                        pj = pj.squeeze(0)     # [1,K,D] -> [K,D]
-                    if pj.dim() == 2 and pj.size(0) == 1 and pj.size(1) == sj.size(-1):
-                        # [1,D] -> 单动作，兼容
-                        pass
-                    Kj = pj.size(0) if pj.dim() == 2 else 1
+                        pj = pj.squeeze(0)   # [1,K,D] -> [K,D]
                     if pj.dim() == 1:
-                        pj = pj.unsqueeze(0)   # [D] -> [1,D]
-                        Kj = 1
+                        pj = pj.unsqueeze(0) # [D] -> [1,D]
+
+                    Kj = pj.size(0) if pj.dim() == 2 else 1
                     rep_sj = sj.expand(Kj, *sj.shape[1:])  # [Kj,M,D]
                     q_all_j = target_net(pj, rep_sj).squeeze(-1)  # [Kj]
                     q_all_j = torch.nan_to_num(q_all_j, nan=0.0, posinf=1e6, neginf=-1e6)
                     q_next_max_list.append(q_all_j.max())
-                q_next_max = torch.stack(q_next_max_list, dim=0)  # [B_nf]
-                next_state_values[non_final_mask] = q_next_max
+            next_state_values[non_final_mask] = torch.stack(q_next_max_list, dim=0)
 
-    # ---- Bellman target & loss ----
+    # -------------------- Bellman target & loss --------------------
     target = reward_batch + GAMMA * next_state_values
     target = torch.nan_to_num(target, nan=0.0, posinf=1e6, neginf=-1e6)
 
     loss = F.smooth_l1_loss(q_sa, target)
-    print("[DEBUG] loss:", float(loss.item()))
-    if torch.isnan(loss) or torch.isinf(loss):
-        print("[ERROR] Invalid loss detected!")
-        print("q_sa:", q_sa)
-        print("target:", target)
-        return
 
-    # ---- Backprop ----
+    # -------------------- Backprop --------------------
     optimizerP.zero_grad(set_to_none=True)
     loss.backward()
-
-    # 梯度裁剪 + 打印
     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=grad_clip)
-    with torch.no_grad():
-        total_norm = 0.0
-        print("\n[GRAD DEBUG] ====== Policy Net Gradients ======")
-        for name, p in policy_net.named_parameters():
-            if p.grad is None:
-                print(f"[WARN] No grad in {name}")
-                continue
-            grad = torch.nan_to_num(p.grad, nan=0.0, posinf=1e6, neginf=-1e6)
-            gnorm = grad.norm().item()
-            total_norm += gnorm ** 2
-            if "cross_attention" in name:
-                tag = "[ATTN]"
-            elif "ffn" in name:
-                tag = "[FFN]"
-            elif "q_predictor" in name:
-                tag = "[HEAD]"
-            else:
-                tag = "[OTHER]"
-            print(f"{tag:8s} {name:40s} | mean={grad.mean():.2e}, std={grad.std():.2e}, norm={gnorm:.2e}")
-        total_norm = total_norm ** 0.5
-        print(f"[GRAD DEBUG] Total grad norm: {total_norm:.4f}")
-        print("[GRAD DEBUG] ====================================\n")
-
     optimizerP.step()
 
+    # for logging
     optimize_model_conv.last_loss = float(loss.item())
     optimize_model_conv.last_q_mean = float(q_sa.mean().item())
     optimize_model_conv.last_reward_mean = float(reward_batch.mean().item())
-    print("=== [DEBUG] Optimization done ===")
 
-
-# def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP,
-#                         GAMMA, BATCH_SIZE):
-#     print("\n=== [DEBUG] Enter optimize_model_conv ===")
-#     print(f"len(memory): {len(memory)}, BATCH_SIZE: {BATCH_SIZE}")
-
-#     if len(memory) < BATCH_SIZE:
-#         print("[DEBUG] Memory not enough, skipping update.")
-#         return
-
-#     # ---- Sample ----
-#     transitions = memory.sample(BATCH_SIZE)
-#     batch = Transition(*zip(*transitions))
-
-#     if random.random() < 0.02:  # 约每50次打印一次
-#         print("[DEBUG] Sample example:")
-#         print("  reward:", batch.reward[0].item() if torch.is_tensor(batch.reward[0]) else batch.reward[0])
-#         print("  action:", batch.action[0])
-#         print("  state_pool shape:", batch.state_pool[0].shape)
-#         print("  next_state_pool is None?", batch.next_state_pool[0] is None)
-
-#     # ---- Masks ----
-#     non_final_mask = torch.tensor(
-#         tuple(map(lambda s: s is not None, batch.next_state_pool)),
-#         device='cuda', dtype=torch.bool
-#     )
-#     print("[DEBUG] non_final_mask shape:", non_final_mask.shape,
-#           "sum:", non_final_mask.sum().item())
-
-#     try:
-#         non_final_next_states = torch.cat([s for s in batch.next_state_pool if s is not None])
-#         non_final_next_state_subset = torch.cat([s for s in batch.next_state_subset if s is not None])
-#         print("[DEBUG] non_final_next_states shape:", non_final_next_states.shape)
-#     except Exception as e:
-#         print("[ERROR] non_final_next_states concat failed:", e)
-#         return
-
-#     # ---- Batches ----
-#     state_batch_pool = torch.cat(batch.state_pool)
-#     state_batch_subset = torch.cat(batch.state_subset)
-#     action_batch = torch.cat([a.unsqueeze(0) for a in batch.action])
-#     reward_batch = torch.cat([r.unsqueeze(0) for r in batch.reward])
-
-#     for i, a in enumerate(batch.action):
-#         if a.dim() == 0:
-#             print(f"[WARN] batch.action[{i}] is scalar:", a)
-
-
-#     print("[DEBUG] state_batch_pool:", state_batch_pool.shape)
-#     print("[DEBUG] state_batch_subset:", state_batch_subset.shape)
-#     print("[DEBUG] action_batch:", action_batch.shape,
-#           "min:", action_batch.min().item(), "max:", action_batch.max().item())
-#     print("[DEBUG] reward_batch:", reward_batch.shape,
-#           "min:", reward_batch.min().item(), "max:", reward_batch.max().item())
-
-#     # ---- Forward ----
-#     q_val = policy_net(state_batch_pool.cuda(), state_batch_subset.cuda())
-#     print("[DEBUG] q_val shape:", q_val.shape)
-
-#     # ---- Gather safety check ----
-#     # if (action_batch >= q_val.size(1)).any():
-#     #     print("[ERROR] action index out of bounds!",
-#     #           "action_batch.max():", action_batch.max().item(),
-#     #           "q_val.size(1):", q_val.size(1))
-#     #     action_batch = action_batch.clamp(0, q_val.size(1) - 1)
-
-#     state_action_values = q_val.squeeze(-1)  # 直接取预测的Q值
-#     print("[DEBUG] state_action_values:", state_action_values.shape)
-
-#     # ---- Next Q computation ----
-#     next_state_values = torch.zeros(BATCH_SIZE, device='cuda')
-
-#     if non_final_mask.sum().item() > 0:
-#         target_out = target_net(non_final_next_states.cuda(), non_final_next_state_subset.cuda())
-#         print("[DEBUG] target_out shape:", target_out.shape)
-#         next_state_values[non_final_mask] = target_out.squeeze(-1).detach()
-
-#     expected_state_action_values = (next_state_values * GAMMA) + reward_batch
-#     print("[DEBUG] expected_state_action_values:", expected_state_action_values.shape)
-
-#     # ---- Loss ----
-#     state_action_values = state_action_values.view(-1, 1)  # [B, 1]
-#     expected_state_action_values = expected_state_action_values.view(-1, 1)  # [B, 1]
-#     loss = F.smooth_l1_loss(state_action_values,
-#                             expected_state_action_values.unsqueeze(1))
-#     print("[DEBUG] loss:", loss.item())
-
-#     # ---- Sanity checks ----
-#     if torch.isnan(loss) or torch.isinf(loss):
-#         print("[ERROR] Invalid loss detected!")
-#         print("state_action_values:", state_action_values)
-#         print("expected_state_action_values:", expected_state_action_values)
-#         return
-
-
-#     # ---- Backprop ----
-#     optimizerP.zero_grad()
-#     loss.backward()
-#     for name, param in policy_net.named_parameters():
-#         if param.grad is None:
-#             print(f"[WARN] No grad in {name}")
-#         else:
-#             print(f"[DEBUG] grad[{name}]: mean={param.grad.mean():.6f}, std={param.grad.std():.6f}")
-#     optimizerP.step()
-
-#     optimize_model_conv.last_loss = loss.item()
-#     optimize_model_conv.last_q_mean = q_val.mean().item()
-#     optimize_model_conv.last_reward_mean = reward_batch.mean().item()
-
-#     print("=== [DEBUG] Optimization done ===")
-
-
-# def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP, BATCH_SIZE=32, GAMMA=0.999,
-#                         dqn_epochs=1):
-#     """
-#     此版本适配包含 state_pool, state_subset 等多个独立字段的 Transition 结构。
-#     """
-#     if len(memory) < BATCH_SIZE:
-#         return
-
-#     print('Optimizing policy network...')
-
-#     policy_net.train()
-#     loss_item = 0
-
-#     for ep in range(dqn_epochs):
-#         optimizerP.zero_grad()
-#         transitions = memory.sample(BATCH_SIZE)
-#         batch = Transition(*zip(*transitions))
-
-#         # 1. 创建非终止状态的掩码
-#         non_final_mask = torch.tensor(tuple(map(lambda s: s is not None,
-#                                                 batch.next_state_pool)),  # 使用 next_state_pool 检查
-#                                       dtype=torch.bool, device='cuda')
-
-#         # 2. 准备下一状态的两个部分
-#         non_final_next_states_pool = torch.cat([s for s in batch.next_state_pool if s is not None])
-#         non_final_next_states_subset = torch.cat([s for s in batch.next_state_subset if s is not None])
-
-#         # 3. 准备当前状态的两个部分
-#         state_batch_pool = torch.cat(batch.state_pool)
-#         state_batch_subset = torch.cat(batch.state_subset)
-
-#         # 4. 准备 action 和 reward
-#         action_batch = torch.stack(batch.action).long().cuda()  # ✅ This is the correct fix
-#         reward_batch = torch.stack(batch.reward).cuda()
-
-#         # 计算 Q(s_t, a)
-#         q_val = policy_net(state_batch_pool.cuda(), state_batch_subset.cuda())
-
-#         # print("q_val.shape:", q_val.shape)
-#         # print("action_batch.shape:", action_batch.shape)
-#         # print("action_batch unique values:", action_batch.unique())
-
-#         state_action_values = q_val.gather(1, action_batch.unsqueeze(1)).squeeze(1)
-#         # state_action_values = q_val.squeeze(-1)  # 或 q_val.flatten()，得到 [B]
-
-#         # 计算 V(s_{t+1})
-#         next_state_values = torch.zeros(BATCH_SIZE, device='cuda')
-
-#         print("=== optimize_model_conv debug ===")
-#         print("batch size:", BATCH_SIZE)
-#         print("non_final_mask:", non_final_mask)
-#         print("non_final_mask.sum():", non_final_mask.sum())
-#         print("actions shape:", action_batch.shape)
-#         print("actions max:", action_batch.max().item(), "min:", action_batch.min().item())
-#         print("q_val shape:", q_val.shape)
-
-#         if non_final_mask.sum().item() > 0:
-#             # 使用 Double DQN 逻辑
-#             next_q_values_policy = policy_net(non_final_next_states_pool.cuda(),
-#                                               non_final_next_states_subset.cuda()).detach()
-#             best_actions = next_q_values_policy.max(1)[1].unsqueeze(1)
-#             next_q_values_target = target_net(non_final_next_states_pool.cuda(),
-#                                               non_final_next_states_subset.cuda()).detach()
-#             next_state_values[non_final_mask] = next_q_values_target.gather(1, best_actions).squeeze()
-
-#         # 计算期望的 Q 值
-#         expected_state_action_values = (next_state_values * GAMMA) + reward_batch
-
-#         # 计算 Huber loss
-#         loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
-
-#         loss_item += loss.item()
-#         progress_bar(ep, dqn_epochs, '[DQN loss %.5f]' % (loss_item / (ep + 1)))
-        
-#         loss.backward()
-#         total_grad = 0.0
-#         for n, p in policy_net.named_parameters():
-#             if p.grad is not None:
-#                 total_grad += p.grad.norm().item()
-#         print(f"[GradNorm] {total_grad:.6f}")
-
-#         # REASON: 强化学习的训练过程容易不稳定，可能会产生非常大的梯度，
-#         #         导致网络权重更新过猛（“梯度爆炸”），从而破坏学习过程。
-#         #         梯度裁剪将所有参数的梯度范数强制限制在一个最大值（这里是1.0）以内，
-#         #         确保了每次更新的步长都是合理的，从而极大地稳定了训练。
-#         torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=1.0)
-#         optimizerP.step()
-
-#         del (q_val)
-#         del (expected_state_action_values)
-#         del (loss)
-#         del (next_state_values)
-#         del (reward_batch)
-#         # if non_final_mask.sum().item() > 0:
-#         #     del (act)
-#         #     del (v_val)
-#         #     del (v_val_act)
-#         del (state_action_values)
-#         # del (state_batch)
-#         del (action_batch)
-#         del (non_final_mask)
-#         # del (non_final_next_states)
-#         del (batch)
-#         del (transitions)
-#     lab_set = open(os.path.join(args.ckpt_path, args.exp_name, 'q_loss.txt'), 'a')
-#     lab_set.write("%f" % (loss_item))
-#     lab_set.write("\n")
-#     lab_set.close()
 
 def debug_optimize_model_conv(memory, Transition, BATCH_SIZE=4):
     import torch
