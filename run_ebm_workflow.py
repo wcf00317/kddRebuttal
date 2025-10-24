@@ -23,7 +23,7 @@ from utils.feature_extractor import UnifiedFeatureExtractor, get_all_unlabeled_e
 from torch.utils.data import Subset, DataLoader
 from data.data_utils import get_data
 from utils.final_utils import check_mkdir, create_and_load_optimizers, get_logfile
-from utils.replay_buffer import ReplayMemory
+from utils.replay_                                                                                                                                                                                             import ReplayMemory
 import utils.parser as parser
 from run_rl_with_alrm import train_har_classifier, train_har_for_reward
 import utils.al_scoring as scoring
@@ -112,7 +112,6 @@ def get_available_strategies(args):
         'use_labeled_distance_feature': ('labeled_distance', scoring.compute_labeled_distance_score),
         'use_neighborhood_density_feature': ('neighborhood_density', scoring.compute_neighborhood_density_score),
         'use_temporal_consistency_feature': ('temporal_consistency', scoring.compute_temporal_consistency_score),
-        'use_cross_view_consistency_feature': ('cross_view_consistency', scoring.compute_cross_view_consistency_score)
     }
     available_strategies = [
         ('bald', scoring.compute_bald_score),
@@ -133,11 +132,27 @@ def main():
     random.seed(args.seed)
     np.random.seed(args.seed)
 
-    timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    args.exp_name = f"{args.exp_name}_{timestamp}"
-    exp_dir = os.path.join(args.ckpt_path, args.exp_name)
-    check_mkdir(args.ckpt_path)
-    check_mkdir(exp_dir)
+    if args.exp_name_toload:
+        # 如果指定了要加载的实验，则 exp_name 就是那个完整目录名
+        # 并且我们不覆盖 args.exp_name_toload
+        print(f"--- 正在加载已存在的实验: {args.exp_name_toload} ---")
+        # 将 args.exp_name 也设置为加载的名称，以便日志和优化器加载统一
+        args.exp_name = args.exp_name_toload
+        exp_dir = os.path.join(args.ckpt_path, args.exp_name_toload)
+        # 确保基础路径存在，但不创建 exp_dir (因为它应该已存在)
+        check_mkdir(args.ckpt_path)
+        if not os.path.exists(exp_dir):
+            print(f"严重警告: 尝试加载 {exp_dir}，但目录不存在！")
+            # 仍然创建它，以防万一，但跳过逻辑会失败
+            check_mkdir(exp_dir)
+    else:
+        # 如果是新实验，才添加时间戳
+        print("--- 正在创建新实验 ---")
+        timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        args.exp_name = f"{args.exp_name}_{timestamp}"
+        exp_dir = os.path.join(args.ckpt_path, args.exp_name)
+        check_mkdir(args.ckpt_path)
+        check_mkdir(exp_dir)
 
     sys.stdout = VerboseLogger(os.path.join(exp_dir, 'verbose_run_log.txt'))
     parser.save_arguments(args)
@@ -148,111 +163,165 @@ def main():
     # ===================================================================================
     #              第一阶段: 使用特征两端提取法收集偏好数据
     # ===================================================================================
-    print("\n" + "=" * 25 + "  STAGE 1: PREFERENCE DATA COLLECTION  " + "=" * 25)
-
-    feature_extractor = UnifiedFeatureExtractor(args)
-    net_stage1, _, _ = create_models(dataset=args.dataset, model_cfg_path=args.model_cfg_path,
-                                     model_ckpt_path=args.model_ckpt_path, num_classes=args.num_classes,
-                                     use_policy=False,
-                                     embed_dim=args.embed_dim)
-    net_stage1.cuda()
-    aug_level = args.augment_level if getattr(args, 'use_cross_view_consistency_feature', False) else None
-
-    _, train_set, _, _ = get_data(
-        data_path=args.data_path, tr_bs=args.train_batch_size, vl_bs=args.val_batch_size,
-        dataset_name=args.dataset, n_workers=args.workers, clip_len=args.clip_len,
-        augment_level=aug_level,initial_labeled_ratio=args.initial_labeled_ratio,model_type=args.model_type
-    )
-
-    alrm_preference_data = []
-    unlabeled_indices = train_set.get_candidates_video_ids()
-    if not unlabeled_indices:
-        raise ValueError("未标注池为空，无法进行数据收集。")
-
-    # precomputed_data = scoring.precompute_data_for_scoring(
-    #     args, net_stage1, unlabeled_indices, train_set, batch_size=args.val_batch_size
-    # )
-
-    print("正在为所有策略预计算全局分数...")
-    strategies_to_run = get_available_strategies(args)
-    precomputed_data = scoring.precompute_data_for_scoring(
-        args, net_stage1, unlabeled_indices, train_set, batch_size=args.val_batch_size
-    )
-
-    all_scores_map = {}
-    for strategy_name, scoring_function in tqdm(strategies_to_run, desc="全局分数计算"):
-        if strategy_name in ['bald', 'egl']:
-            all_scores_map[strategy_name] = scoring_function(net_stage1, unlabeled_indices, train_set)
-        else:
-            all_scores_map[strategy_name] = scoring_function(precomputed_data)
-    print("全局分数计算完成。")
-
-    # --- 步骤 2: 保持您原有的For循环结构，用于筛选和特征化 ---
-    print("\n开始遍历策略以提取两端批次...")
-    for strategy_name, _ in tqdm(strategies_to_run, desc="为不同策略提取特征两端样本"):
-        print(f"\n--- 处理策略: {strategy_name} ---")
-
-        # a. 从预计算的全局分数中获取当前策略的分数
-        scores = all_scores_map[strategy_name]
-
-        if scores.numel() == 0:
-            print(f"警告: 策略 {strategy_name} 未能计算出任何分数，跳过。")
-            continue
-
-        # b. 选出最好和最差样本的位置索引
-        k = min(args.num_each_iter, len(unlabeled_indices))
-        top_scores, top_pos_indices = torch.topk(scores, k=k, largest=True)
-        bottom_scores, bottom_pos_indices = torch.topk(scores, k=k, largest=False)
-
-        # c. 根据位置索引获取视频ID
-        winner_batch_indices = [unlabeled_indices[i] for i in top_pos_indices]
-        loser_batch_indices = [unlabeled_indices[i] for i in bottom_pos_indices]
-
-        # d. (核心修正) 为选出的批次打包所有策略的分数
-        winner_batch_scores = {s_name: all_scores_map[s_name][top_pos_indices] for s_name, _ in strategies_to_run}
-        loser_batch_scores = {s_name: all_scores_map[s_name][bottom_pos_indices] for s_name, _ in strategies_to_run}
-
-        # e. 使用修正后的、正确的参数调用 extract 函数
-        winner_features = feature_extractor.extract(
-            winner_batch_indices, net_stage1, train_set, batch_scores=winner_batch_scores
-        )
-        loser_features = feature_extractor.extract(
-            loser_batch_indices, net_stage1, train_set, batch_scores=loser_batch_scores
-        )
-
-        alrm_preference_data.append({'winner': winner_features, 'loser': loser_features})
-        # --- 新增的详细日志输出 ---
-        print(f"  [好学生 - Winner Batch]")
-        print(f"    - 样本索引: {winner_batch_indices}")
-        print(f"    - 对应分数: {[f'{s:.4f}' for s in top_scores.tolist()]}")
-
-        print(f"  [坏学生 - Loser Batch]")
-        print(f"    - 样本索引: {loser_batch_indices}")
-        print(f"    - 对应分数: {[f'{s:.4f}' for s in bottom_scores.tolist()]}")
-        print(f"{'=' * 50}\n")
-
     alrm_data_path = os.path.join(exp_dir, 'alrm_preference_data.pkl')
-    with open(alrm_data_path, 'wb') as f:
-        pickle.dump(alrm_preference_data, f)
-    print(f"\n--- STAGE 1 COMPLETE --- 偏好数据已保存至 {alrm_data_path}，共 {len(alrm_preference_data)} 对。")
-    del net_stage1, train_set, precomputed_data
-    torch.cuda.empty_cache()
+    if os.path.exists(alrm_data_path):
+        print(f"\n--- STAGE 1 SKIPPED --- 正在从 {alrm_data_path} 加载已有的偏好数据...")
+        with open(alrm_data_path, 'rb') as f:
+            alrm_preference_data = pickle.load(f)
+        feature_extractor = UnifiedFeatureExtractor(args)
+        aug_level = args.augment_level if getattr(args, 'use_cross_view_consistency_feature',
+                                                  False) else None  # Stage 3 需要
+
+    else:
+        print("\n" + "=" * 25 + "  STAGE 1: PREFERENCE DATA COLLECTION  " + "=" * 25)
+
+        feature_extractor = UnifiedFeatureExtractor(args)
+        net_stage1, _, _ = create_models(dataset=args.dataset, model_cfg_path=args.model_cfg_path,
+                                         model_ckpt_path=args.model_ckpt_path, num_classes=args.num_classes,
+                                         use_policy=False,
+                                         embed_dim=args.embed_dim)
+        net_stage1.cuda()
+        aug_level = args.augment_level if getattr(args, 'use_cross_view_consistency_feature', False) else None
+
+        _, train_set, _, _ = get_data(
+            data_path=args.data_path, tr_bs=args.train_batch_size, vl_bs=args.val_batch_size,
+            dataset_name=args.dataset, n_workers=args.workers, clip_len=args.clip_len,
+            augment_level=aug_level,initial_labeled_ratio=args.initial_labeled_ratio,model_type=args.model_type
+        )
+
+        unlabeled_indices = train_set.get_candidates_video_ids()
+        if not unlabeled_indices:
+            raise ValueError("未标注池为空，无法进行数据收集。")
+
+        # precomputed_data = scoring.precompute_data_for_scoring(
+        #     args, net_stage1, unlabeled_indices, train_set, batch_size=args.val_batch_size
+        # )
+
+        print("正在为所有策略预计算全局分数...")
+        strategies_to_run = get_available_strategies(args)
+        precomputed_data = scoring.precompute_data_for_scoring(
+            args, net_stage1, unlabeled_indices, train_set, batch_size=args.val_batch_size
+        )
+
+        all_scores_map = {}
+        for strategy_name, scoring_function in tqdm(strategies_to_run, desc="全局分数计算"):
+            if strategy_name in ['bald', 'egl']:
+                all_scores_map[strategy_name] = scoring_function(net_stage1, unlabeled_indices, train_set)
+            else:
+                all_scores_map[strategy_name] = scoring_function(precomputed_data )
+        print("全局分数计算完成。")
+
+        # --- 步骤 2: 保持您原有的For循环结构，用于筛选和特征化 ---
+        print("\n开始遍历策略以提取两端批次...")
+        alrm_preference_data = []
+
+        # --- 外层循环：遍历每种策略 ---
+        for strategy_name, _ in tqdm(strategies_to_run, desc="为不同策略提取特征两端样本"):
+            print(f"\n--- 处理策略: {strategy_name} ---")
+
+            # 获取当前策略对所有【原始】未标注样本的分数
+            # 注意：这里的 scores 是针对【全部】未标注样本计算的，我们后续需要从中筛选
+            scores = all_scores_map[strategy_name]
+
+            if scores.numel() == 0:
+                print(f"警告: 策略 {strategy_name} 未能计算出任何分数，跳过。")
+                continue
+
+            # 初始化当前策略下【可用】的样本索引列表（初始时为所有样本）
+            # 我们用位置索引 (0 到 N-1) 来操作
+            available_pos_indices = list(range(len(unlabeled_indices)))
+
+            # --- 内层循环：为当前策略生成 N 对偏好数据 ---
+            num_pairs_generated_for_strategy = 0
+            for pair_idx in range(args.num_pairs_per_strategy):
+
+                # 检查是否还有足够的样本可选 (至少需要 2*k 个)
+                if len(available_pos_indices) < 2 * args.num_each_iter:
+                    print(
+                        f"  [WARN] 第 {pair_idx + 1} 对: 可用样本不足 ({len(available_pos_indices)} < {2 * args.num_each_iter})，停止为策略 {strategy_name} 生成更多对。")
+                    break
+
+                print(f"  --- 生成第 {pair_idx + 1}/{args.num_pairs_per_strategy} 对 ---")
+
+                # 从【可用】样本的分数中选出 Top-k 和 Bottom-k
+                # 1. 获取可用样本对应的分数
+                current_available_scores = scores[available_pos_indices]
+
+                # 2. 在可用分数中找 Top-k 和 Bottom-k 的【相对索引】
+                k = min(args.num_each_iter, len(available_pos_indices) // 2)  # 确保 k 不超过可用的一半
+
+                top_scores_relative, top_relative_indices = torch.topk(current_available_scores, k=k, largest=True)
+                bottom_scores_relative, bottom_relative_indices = torch.topk(current_available_scores, k=k,
+                                                                             largest=False)
+
+                # 3. 将【相对索引】映射回【原始位置索引】
+                top_pos_indices_original = torch.tensor([available_pos_indices[i] for i in top_relative_indices])
+                bottom_pos_indices_original = torch.tensor([available_pos_indices[i] for i in bottom_relative_indices])
+
+                # 4. 根据【原始位置索引】获取视频 ID
+                winner_batch_indices = [unlabeled_indices[i] for i in top_pos_indices_original]
+                loser_batch_indices = [unlabeled_indices[i] for i in bottom_pos_indices_original]
+
+                # 5. 打包所有策略的分数（使用原始位置索引）
+                winner_batch_scores = {s_name: all_scores_map[s_name][top_pos_indices_original] for s_name, _ in
+                                       strategies_to_run}
+                loser_batch_scores = {s_name: all_scores_map[s_name][bottom_pos_indices_original] for s_name, _ in
+                                      strategies_to_run}
+
+                # 6. 提取特征
+                winner_features = feature_extractor.extract(
+                    winner_batch_indices, net_stage1, train_set, batch_scores=winner_batch_scores
+                )
+                loser_features = feature_extractor.extract(
+                    loser_batch_indices, net_stage1, train_set, batch_scores=loser_batch_scores
+                )
+
+                # 7. 添加到结果列表
+                alrm_preference_data.append({'winner': winner_features, 'loser': loser_features})
+                num_pairs_generated_for_strategy += 1
+
+                # 8. 更新可用样本索引列表：移除刚刚被选中的 Winner 和 Loser
+                # 注意：需要从后往前删除，或者转换成集合操作，以避免索引错位
+                indices_to_remove = set(top_pos_indices_original.tolist() + bottom_pos_indices_original.tolist())
+                available_pos_indices = [idx for idx in available_pos_indices if idx not in indices_to_remove]
+
+                # --- 日志输出 (使用相对分数) ---
+                print(f"    [好学生 - Winner Batch]")
+                print(f"      - 样本索引 (原始): {winner_batch_indices}")
+                print(f"      - 对应分数: {[f'{s:.4f}' for s in top_scores_relative.tolist()]}")  # 用相对分数
+                print(f"    [差学生 - Loser Batch]")  # 改回 Loser
+                print(f"      - 样本索引 (原始): {loser_batch_indices}")
+                print(f"      - 对应分数: {[f'{s:.4f}' for s in bottom_scores_relative.tolist()]}")  # 用相对分数
+                print(f"    剩余可用样本数: {len(available_pos_indices)}")
+
+            print(f"--- 策略 {strategy_name} 完成，共生成 {num_pairs_generated_for_strategy} 对偏好数据 ---")
+            print(f"{'=' * 50}\n")
+        alrm_data_path = os.path.join(exp_dir, 'alrm_preference_data.pkl')
+        with open(alrm_data_path, 'wb') as f:
+            pickle.dump(alrm_preference_data, f)
+        print(f"\n--- STAGE 1 COMPLETE --- 偏好数据已保存至 {alrm_data_path}，共 {len(alrm_preference_data)} 对。")
+        del net_stage1, train_set, precomputed_data
+        torch.cuda.empty_cache()
 
     # ===================================================================================
     #                         第二阶段: 训练 EBM 奖励模型
     # ===================================================================================
-    print("\n" + "=" * 25 + "  STAGE 2: EBM REWARD MODEL TRAINING  " + "=" * 25)
+    scorer_path = os.path.join(exp_dir, 'ebm_scorer.pkl')
+    if os.path.exists(scorer_path):
+        print(f"\n--- STAGE 2 SKIPPED --- 已找到 {scorer_path}，跳过EBM训练。")
+    else:
+        print("\n" + "=" * 25 + "  STAGE 2: EBM REWARD MODEL TRAINING  " + "=" * 25)
 
-    training_successful = train_ebm_reward_model(alrm_preference_data, exp_dir,
-        feature_names=feature_extractor.feature_dim_names)
+        training_successful = train_ebm_reward_model(alrm_preference_data, exp_dir,
+            feature_names=feature_extractor.feature_dim_names)
 
-    if not training_successful:
-        print("EBM奖励模型训练失败，工作流程终止。")
-        return
+        if not training_successful:
+            print("EBM奖励模型训练失败，工作流程终止。")
+            return
 
-    print(f"--- STAGE 2 COMPLETE ---")
-    del alrm_preference_data
-    torch.cuda.empty_cache()
+        print(f"--- STAGE 2 COMPLETE ---")
+        del alrm_preference_data
+        torch.cuda.empty_cache()
 
     # ===================================================================================
     #                  第三阶段: 使用 EBM 奖励模型训练 RL 智能体
@@ -287,7 +356,6 @@ def main():
     Transition = namedtuple('Transition',
                             ('state_pool', 'state_subset', 'action', 'next_state_pool', 'next_state_subset', 'reward'))    
     memory = ReplayMemory(args.rl_buffer)
-    TARGET_UPDATE = 5
     steps_done = 0
     target_net.load_state_dict(policy_net.state_dict())
     target_net.eval()
@@ -332,7 +400,7 @@ def main():
 
         # --- 核心修改: 使用 EBM 预测奖励 ---
         predicted_reward = predict_ebm_reward(ebm_scorer, batch_features)
-        print(f"EBM 预测奖励 (P(x > μ)): {predicted_reward:.4f}")
+        print(f"EBM 预测奖励 (P(x > μ)): {predicted_reward}")
 
         add_labeled_videos(args, [], actual_video_ids_to_label, train_set_rl, budget=args.budget_labels, n_ep=i)
 
@@ -359,8 +427,7 @@ def main():
             next_pool, next_subset = None, None
 
         # 批次级 reward（标量）
-        reward_scalar = float(predicted_reward)
-        reward_tensor = torch.as_tensor(reward_scalar, dtype=torch.float, device='cuda')  # 0-D 张量
+        reward_tensor = predicted_reward.cuda()
 
         for idx in sel_idxs:
             action_embed = pool[idx]  # [D] —— “被执行的动作的向量”，样本级
@@ -374,10 +441,12 @@ def main():
             )
 
         if len(memory) >= args.dqn_bs:
-            optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP, GAMMA=args.dqn_gamma,
-                                BATCH_SIZE=args.dqn_bs)
-        if i % TARGET_UPDATE == 0:
-            target_net.load_state_dict(policy_net.state_dict())
+            loss_val = optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP, GAMMA=args.dqn_gamma,
+                                BATCH_SIZE=args.dqn_bs,TAU=args.dqn_tau)
+            if loss_val is not None:
+                # (您现有的 debug 日志)
+                print(
+                    f"--- [LOG] loss={loss_val:.6f}, q_mean={getattr(optimize_model_conv, 'last_q_mean', 'N/A')}, reward_mean={getattr(optimize_model_conv, 'last_reward_mean', 'N/A')}")
 
     print("\n预算用尽，在所有已选数据上训练至收敛...")
     final_log_path = os.path.join(exp_dir, 'final_convergence_log.txt')

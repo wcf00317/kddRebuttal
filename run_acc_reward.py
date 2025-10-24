@@ -60,8 +60,13 @@ def main(args):
                                                 embed_dim=args.embed_dim)
 
     _, train_set, val_loader, _ = get_data(
-        data_path=args.data_path, tr_bs=args.train_batch_size, vl_bs=args.val_batch_size,
-        n_workers=args.workers, clip_len=args.clip_len
+        data_path=args.data_path,
+        tr_bs=args.train_batch_size,
+        vl_bs=args.val_batch_size,
+        dataset_name=args.dataset,
+        model_type=args.model_type,
+        n_workers=args.workers,
+        clip_len=args.clip_len
     )
     criterion = nn.CrossEntropyLoss().cuda()
 
@@ -94,9 +99,16 @@ def main(args):
                                     batch_size=args.train_batch_size, shuffle=True,
                                     num_workers=args.workers)
         # 使用一个独立的优化器来评估初始准确率，避免影响主优化器状态
-        initial_optimizer = \
-        create_and_load_optimizers(net=net, opt_choice=args.optimizer, lr=args.lr, wd=args.weight_decay,
-                                   momentum=args.momentum, load_opt=False)[0]
+        initial_optimizer = create_and_load_optimizers(
+            net=net, opt_choice=args.optimizer, lr=args.lr, wd=args.weight_decay,
+            momentum=args.momentum,
+            ckpt_path=args.ckpt_path,
+            exp_name_toload=None,
+            exp_name=args.exp_name,
+            snapshot=args.snapshot,
+            checkpointer=False,  # 临时计算，不加载 checkpoint
+            load_opt=False  # 临时计算，不加载 optimizer 状态
+        )[0]
         _, past_val_acc = train_har_for_reward(net, initial_loader, val_loader, initial_optimizer, criterion, args)
         print(f"初始基准准确率: {past_val_acc:.4f}")
 

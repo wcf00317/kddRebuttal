@@ -11,9 +11,9 @@ from utils.final_utils import get_logfile
 from utils.progressbar import progress_bar
 from mmaction.apis import init_recognizer
 from models.query_network import AdvancedTransformerPolicyNet  # 假设你已保存该类
-EPS_START = 0.9
+EPS_START = 0.8
 EPS_END = 0.05
-EPS_DECAY = 200
+EPS_DECAY = 20
 
 
 
@@ -694,7 +694,7 @@ import torch
 import torch.nn.functional as F
 
 def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimizerP,
-                        GAMMA, BATCH_SIZE, grad_clip=1.0, use_padding=True):
+                        GAMMA, BATCH_SIZE,TAU, grad_clip=1.0, use_padding=True):
     import torch
     import torch.nn.functional as F
     import random
@@ -740,7 +740,10 @@ def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimi
         else:
             reward_elems.append(torch.tensor(r, dtype=torch.float))
     reward_batch = torch.stack(reward_elems, dim=0).to(device)  # [B]
-
+    reward_mean = reward_batch.mean()
+    reward_std = reward_batch.std()
+    reward_batch = (reward_batch - reward_mean) / (reward_std + 1e-7)  # 加上 epsilon
+    print(f"[DEBUG] Normalized Rewards -> Mean: {reward_batch.mean().item():.6f}, Std: {reward_batch.std().item():.6f}")
     # -------------------- Q(s,a) --------------------
     # policy_net 接口： (x=[B,D], subset=[B,M,D]) -> [B] or [B,1]
     q_sa = policy_net(state_batch_pool, state_batch_subset)
@@ -814,13 +817,23 @@ def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimi
             rep_next_subset = nf_next_subset.unsqueeze(1).expand(B_nf, K, *nf_next_subset.shape[1:]) \
                                                .reshape(B_nf * K, *nf_next_subset.shape[1:])
             with torch.no_grad():
-                q_next_all = target_net(flat_next_x, rep_next_subset).reshape(B_nf, K)  # [B_nf,K]
-                q_next_all = torch.nan_to_num(q_next_all, nan=0.0, posinf=1e6, neginf=-1e6)
-                if use_padding and len(set(ks)) != 1:
-                    valid_mask = torch.arange(K, device=device).unsqueeze(0) < torch.tensor(ks, device=device).unsqueeze(1)
-                    q_next_all = q_next_all.masked_fill(~valid_mask, float('-inf'))
-                q_next_max = q_next_all.max(dim=1).values  # [B_nf]
-            next_state_values[non_final_mask] = q_next_max
+                q_next_policy = policy_net(flat_next_x, rep_next_subset).reshape(B_nf, K)
+                q_next_policy = torch.nan_to_num(q_next_policy, nan=float('-inf'))  # Treat NaN as worst action
+                if use_padding and len(set(ks)) != 1:  # Apply mask before argmax
+                    valid_mask = torch.arange(K, device=device).unsqueeze(0) < torch.tensor(ks,
+                                                                                            device=device).unsqueeze(1)
+                    q_next_policy = q_next_policy.masked_fill(~valid_mask, float('-inf'))
+                best_next_actions = q_next_policy.argmax(dim=1, keepdim=True)  # Shape: [B_nf, 1]
+
+                # b) 使用 target_net 评估这些被选定动作的Q值
+                q_next_target = target_net(flat_next_x, rep_next_subset).reshape(B_nf, K)
+                q_next_target = torch.nan_to_num(q_next_target, nan=0.0, posinf=1e6,
+                                                 neginf=-1e6)  # NaN handling for value
+                # 使用 gather() 来挑选出与 best_next_actions 对应的 Q 值
+                q_next_max = q_next_target.gather(1, best_next_actions).squeeze()  # Shape: [B_nf]
+
+                # (移除旧的 q_next_all 计算和 mask 应用)
+                next_state_values[non_final_mask] = q_next_max
 
         except RuntimeError:
             # 逐样本fallback（K可变时）
@@ -859,6 +872,13 @@ def optimize_model_conv(args, memory, Transition, policy_net, target_net, optimi
     loss.backward()
     torch.nn.utils.clip_grad_norm_(policy_net.parameters(), max_norm=grad_clip)
     optimizerP.step()
+    #实现软更新
+    target_net_state_dict = target_net.state_dict()
+    policy_net_state_dict = policy_net.state_dict()
+    for key in policy_net_state_dict:
+        # target_weights = (1-TAU)*target_weights + TAU*policy_weights
+        target_net_state_dict[key] = target_net_state_dict[key] * (1 - TAU) + policy_net_state_dict[key] * TAU
+    target_net.load_state_dict(target_net_state_dict)
 
     # for logging
     optimize_model_conv.last_loss = float(loss.item())

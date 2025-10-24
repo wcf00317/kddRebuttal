@@ -70,10 +70,13 @@ def get_arguments():
     parser.add_argument('--dqn_bs', type=int, default=5)
     parser.add_argument('--dqn_opt_per_iter', type=int, default=10)
     parser.add_argument('--dqn_gamma', type=float, default=0.99)
+    parser.add_argument('--dqn_tau', type=float, default=0.005,
+                        help='Rate for soft updating the target network (e.g., 0.005)')
     parser.add_argument('--egl_strategy', type=str, default='adaptive_k',
                         choices=['adaptive_k', 'approx', 'standard'],
                         help='要使用的EGL计算策略: adaptive_k (自适应), approx (快速近似), standard (理论标准版).')
-
+    parser.add_argument('--num_pairs_per_strategy', type=int, default=20,
+                        help='Number of Winner/Loser pairs to generate per AL strategy in Stage 1')
     parser.add_argument('--nomination_ratio_c', type=float, default=3.0,
                         help='Ratio to determine nomination pool size (c * budget).')
     parser.add_argument('--run_sanity_check', action='store_true',

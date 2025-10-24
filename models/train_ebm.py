@@ -42,7 +42,7 @@ def train_ebm_reward_model(preference_data, exp_dir, feature_names=None):
     # 2️⃣ 预先计算每维标准差（用于自适应噪声）
     X_all = np.stack([(pair['winner'] - pair['loser']).numpy() for pair in preference_data])
     feat_std = X_all.std(axis=0, keepdims=True)
-    noise_scale = 0.08  # 自适应噪声强度 (建议 0.05~0.1)
+    noise_scale = 0.18  # 自适应噪声强度 (建议 0.05~0.1)
     print(f"[INFO] 使用自适应噪声增强，比例系数 noise_scale={noise_scale}")
 
     # 3️⃣ 构建训练数据
@@ -63,7 +63,7 @@ def train_ebm_reward_model(preference_data, exp_dir, feature_names=None):
             (diff_pos_aug, 1),
             (diff_neg_aug, 0)
         ]:
-            diff_features.append(x)
+            diff_features.append(x.reshape(1, -1))
             labels.append(y)
 
         print(f"[DEBUG] diff_pos mean={diff_pos.mean():.4f}, std={diff_pos.std():.4f}")
@@ -81,9 +81,10 @@ def train_ebm_reward_model(preference_data, exp_dir, feature_names=None):
     print("--- 开始训练EBM分类器 ---")
     ebm = ExplainableBoostingClassifier(
         random_state=42,
-        interactions=10,     # 启用交互项
-        max_bins=512,        # 分箱更细
-        outer_bags=20,       # 增强稳定性
+        interactions=2,     # 启用交互项
+        max_bins=32,
+        inner_bags=8,
+        outer_bags=16,       # 增强稳定性
         learning_rate=0.05   # 稳定学习率
     )
     ebm.fit(X_train, y_train)
